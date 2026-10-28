@@ -42,7 +42,13 @@ STORE_NAME = "HDSALE"
 
 # Category name in the sheet -> stable URL slug. Unknown names get a hash slug.
 # Zap scans category links on a fixed address: NEVER rename a slug after Zap connected.
-CATEGORY_SLUGS = {"אופנה": "fashion", "חורף וסקי": "winter-ski"}
+CATEGORY_SLUGS = {
+    "אופנה": "fashion",
+    "חורף וסקי": "winter-ski",
+    "ביגוד ספורט גברים": "mens-sportswear",
+    "ביגוד ספורט נשים": "womens-sportswear",
+    "תינוקות וילדים קטנים": "babies-kids",
+}
 
 MIN_IMAGE_SIDE = 650        # Zap: at least 650x650
 MAX_IMAGES = 4              # Zap: up to 4 images
@@ -96,7 +102,7 @@ SKU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 CRO_IMG_RE = re.compile(
     r"https?://ecdn\.crosphera\.net/([0-9a-f]{24})/([0-9a-f]{24})\.(?:450|750)\.[A-Za-z0-9.]+"
 )
-ILLEGAL_XML = re.compile(r"[^\x09\x0A\x0D\x20-퟿-�\U00010000-\U0010FFFF]")
+ILLEGAL_XML = re.compile("[^\t\n\r" + chr(0x20) + "-" + chr(0xD7FF) + chr(0xE000) + "-" + chr(0xFFFD) + chr(0x10000) + "-" + chr(0x10FFFF) + "]")
 
 
 # --------------------------------------------------------------------------
@@ -122,7 +128,7 @@ def clean_text(text: str, limit: Optional[int] = None) -> str:
     text = re.sub(r"(?i)<br\s*/?>|</p>|</li>|</div>", " ", text)
     text = re.sub(r"<[^>]+>", " ", text)
     text = html.unescape(text)
-    text = text.replace("\xa0", " ").replace("‏", "").replace("‎", "")
+    text = text.replace("\xa0", " ").replace(chr(0x200F), "").replace(chr(0x200E), "")
     text = ILLEGAL_XML.sub("", text)
     text = re.sub(r"\s+", " ", text).strip()
     if limit is not None:
@@ -185,6 +191,22 @@ def encode_url(url: str) -> str:
 
 def decode_url(url: str) -> str:
     return urllib.parse.unquote(url)
+
+
+def norm_category(raw: str) -> str:
+    """'אביזרים > כפפות' (also '/' or '|' as separators) -> 'אביזרים > כפפות'."""
+    parts = [p.strip() for p in re.split(r"[>/|]", raw or "") if p.strip()]
+    return " > ".join(parts)
+
+
+def category_nodes(paths) -> List[str]:
+    """All category paths including every parent, sorted so parents precede children."""
+    nodes = set()
+    for p in paths:
+        parts = p.split(" > ")
+        for i in range(1, len(parts) + 1):
+            nodes.add(" > ".join(parts[:i]))
+    return sorted(nodes)
 
 
 def slugify_category(name: str) -> str:
@@ -422,7 +444,7 @@ def load_rows(rows: List[List[str]], settings: Dict[str, object], report: Report
                 publish=to_int(cell(r, "publish")),
                 active=active_raw in ("כן", "yes", "y", "true", "1"),
                 price_override=to_float(cell(r, "price")),
-                category=cell(r, "category"),
+                category=norm_category(cell(r, "category")),
             )
         )
         if not SKU_RE.match(out[-1].group):
@@ -895,18 +917,40 @@ def product_xml(it: Item, settings, terms: str) -> str:
     return "\n".join(out)
 
 
+def _nested_ul(categories, base_url: str) -> str:
+    """Nested <ul> like the store's own mirror page: parents contain their children."""
+    out: List[str] = []
+    stack: List[str] = []  # open category paths
+    for path, slug, _n in categories:
+        depth = path.count(" > ")
+        while len(stack) > depth:
+            stack.pop()
+            out.append("</ul></li>")
+        name = path.split(" > ")[-1]
+        out.append(f'<li><a href="{xml_text(base_url)}/categories/{xml_text(slug)}.xml">{xml_text(name)}</a>')
+        nxt = None
+        idx = categories.index((path, slug, _n))
+        if idx + 1 < len(categories):
+            nxt = categories[idx + 1][0]
+        if nxt and nxt.startswith(path + " > "):
+            out.append("<ul>")
+            stack.append(path)
+        else:
+            out.append("</li>")
+    while stack:
+        stack.pop()
+        out.append("</ul></li>")
+    return "\n".join(out)
+
+
 def index_html(categories: List[Tuple[str, str, int]], base_url: str, now: datetime) -> str:
     local = israel_now(now)
-    lis = "\n".join(
-        f'<li><a href="{xml_text(base_url)}/categories/{xml_text(slug)}.xml">{xml_text(name)}</a></li>'
-        for name, slug, _n in categories
-    )
     return (
         '<!DOCTYPE html>\n<html lang="he" dir="rtl">\n<head>\n<meta charset="UTF-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"<title>{STORE_NAME} | אתר מראה לזאפ מרקטפלייס</title>\n</head>\n<body>\n"
         f"<h1>{STORE_NAME}: אתר מראה לזאפ מרקטפלייס</h1>\n<p>עודכן: {local:%d/%m/%Y %H:%M}</p>\n"
-        f"<ul>\n{lis}\n</ul>\n</body>\n</html>\n"
+        f"<ul>\n{_nested_ul(categories, base_url)}\n</ul>\n</body>\n</html>\n"
     )
 
 
@@ -1027,9 +1071,8 @@ def run(
         )
 
     categories_all: Dict[str, str] = {}
-    for r in rows:
-        if r.category:
-            categories_all.setdefault(r.category, slugify_category(r.category))
+    for node in category_nodes([r.category for r in rows if r.category]):
+        categories_all[node] = slugify_category(node)
     slugs: Dict[str, str] = {}
     for name, slug in categories_all.items():
         if slug in slugs and slugs[slug] != name:
@@ -1041,7 +1084,7 @@ def run(
     cats_for_index: List[Tuple[str, str, int]] = []
     for name in sorted(categories_all):
         slug = categories_all[name]
-        cat_items = [it for it in final if it.category == name]
+        cat_items = [it for it in final if it.category == name or it.category.startswith(name + " > ")]
         report.per_category[name] = len(cat_items)
         cats_for_index.append((name, slug, len(cat_items)))
         files[f"categories/{slug}.xml"] = category_xml(cat_items, settings, base_url, now)
