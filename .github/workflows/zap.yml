@@ -1,0 +1,61 @@
+name: Zap marketplace feed
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # every hour
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: zap-feed
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: python -m unittest discover -s tests
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: zap-cache-${{ github.run_id }}
+          restore-keys: zap-cache-
+      - name: Generate feed
+        env:
+          BASE_URL: ${{ vars.BASE_URL }}
+          SHEET_ID: ${{ vars.SHEET_ID }}
+        run: |
+          if [ -z "$BASE_URL" ]; then BASE_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"; fi
+          export BASE_URL
+          python generate.py --out site --report report
+          cat report/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: report
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
