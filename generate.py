@@ -1069,24 +1069,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Zap marketplace mirror generator")
     ap.add_argument("--out", default="site")
     ap.add_argument("--report", default="report")
-    ap.add_argument("--cache", default=os.environ.get("CACHE_DIR", ".cache"))
+    ap.add_argument("--cache", default=os.environ.get("CACHE_DIR") or ".cache")
     ap.add_argument("--terms", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "terms.txt"))
-    ap.add_argument("--base-url", default=os.environ.get("BASE_URL", ""))
+    ap.add_argument("--base-url", default=os.environ.get("BASE_URL") or "")
     args = ap.parse_args(argv)
     if not args.base_url:
         print("חסר BASE_URL (כתובת האתר המראה, למשל https://zap.hdsale.co.il)", file=sys.stderr)
         return 1
     gids = {
-        "products": int(os.environ.get("GID_PRODUCTS", DEFAULT_GIDS["products"])),
-        "settings": int(os.environ.get("GID_SETTINGS", DEFAULT_GIDS["settings"])),
-        "sales": int(os.environ.get("GID_SALES", DEFAULT_GIDS["sales"])),
+        "products": int(os.environ.get("GID_PRODUCTS") or DEFAULT_GIDS["products"]),
+        "settings": int(os.environ.get("GID_SETTINGS") or DEFAULT_GIDS["settings"]),
+        "sales": int(os.environ.get("GID_SALES") or DEFAULT_GIDS["sales"]),
     }
     try:
         report = run(
             Fetcher(),
-            os.environ.get("SHEET_ID", DEFAULT_SHEET_ID),
+            os.environ.get("SHEET_ID") or DEFAULT_SHEET_ID,
             gids,
-            os.environ.get("FEED_CATALOG_URL", DEFAULT_FEED_CATALOG),
+            os.environ.get("FEED_CATALOG_URL") or DEFAULT_FEED_CATALOG,
             args.base_url,
             args.out,
             args.report,
