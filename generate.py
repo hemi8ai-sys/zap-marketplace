@@ -83,6 +83,7 @@ SETTING_KEYS = {
 }
 
 YES_VALUES = ("כן", "yes", "y", "true", "1")
+MANUAL_APPROVAL = "אישור ידני"  # column O: approves enlarging AND images flagged by the quality check
 
 COLUMN_HEADERS = {
     # key: (substring expected in the normalized header, fallback column index)
@@ -266,6 +267,16 @@ class Fetcher:
 # --------------------------------------------------------------------------
 # Report
 # --------------------------------------------------------------------------
+def _fmt(value, digits: int, suffix: str = "") -> str:
+    return "-" if value is None else f"{value:.{digits}f}{suffix}"
+
+
+def _qc_status(e: Dict) -> str:
+    if not e["suspect"]:
+        return "תקין"
+    return f"לבדיקה ({MANUAL_APPROVAL})" if e["in_xml"] else "לבדיקה"
+
+
 @dataclass
 class Report:
     errors: List[str] = field(default_factory=list)      # row excluded / something broken
@@ -276,10 +287,12 @@ class Report:
     approvals: Dict[str, str] = field(default_factory=dict)  # product group -> text; waiting for the owner's OK
     upscaled: Dict[str, Dict] = field(default_factory=dict)  # image id -> details for review.html
 
-    def add_upscaled(self, sku: str, img_id: str, source: str, dims: Tuple[int, int], kind: str) -> None:
+    def add_upscaled(self, sku: str, img_id: str, source: str, dims: Tuple[int, int], kind: str,
+                     qc: Dict[str, object], in_xml: bool) -> None:
         # Variants of one product share images: one entry per image, listing every SKU.
         entry = self.upscaled.setdefault(
-            img_id, {"skus": [], "source": source, "before": f"{dims[0]}x{dims[1]}", "kind": kind}
+            img_id,
+            {"skus": [], "source": source, "before": f"{dims[0]}x{dims[1]}", "kind": kind, "in_xml": in_xml, **qc},
         )
         if sku not in entry["skus"]:
             entry["skus"].append(sku)
@@ -310,9 +323,25 @@ class Report:
             lines.append(
                 "המוצרים האלה לא מפורסמים כי התמונה הראשית באתר קטנה מדי. "
                 "כדי לאשר הגדלה אוטומטית (רק עבור זאפ) כתוב **כן** בעמודה 'אישור הגדלת תמונה' "
-                "בגיליון, באחת משורות המוצר. אפשר גם להחליף את התמונה באתר."
+                "בגיליון, באחת משורות המוצר. אפשר גם להחליף את התמונה באתר. "
+                f"תמונה מוגדלת שסומנה **לבדיקה** בבקרת האיכות נכנסת רק אחרי **{MANUAL_APPROVAL}** באותה עמודה."
             )
             lines.extend(f"- {m}" for m in self.approvals.values())
+            lines.append("")
+        if self.upscaled:
+            lines.append(f"## בקרת איכות: תמונות מוגדלות ({len(self.upscaled)})")
+            lines.append(
+                f"לבדיקה = SSIM מתחת ל-{QC_MIN_SSIM} או מקור קטן מ-{QC_MIN_SOURCE}. "
+                "חדות = שונות Laplacian של המוגדלת (מכווצת חזרה) חלקי המקור. ריפוד = אחוז השוליים הלבנים."
+            )
+            lines.append("")
+            lines.append('| מק"ט | תמונה | סוג | SSIM | חדות | ריפוד | מצב |')
+            lines.append("|---|---|---|---|---|---|---|")
+            for img_id, e in self.upscaled.items():
+                lines.append(
+                    f"| {', '.join(e['skus'])} | `{img_id}` | {e['kind']} | {_fmt(e['ssim'], 3)} | "
+                    f"{_fmt(e['sharpness'], 2)} | {_fmt(e['padding'], 1, '%')} | {_qc_status(e)} |"
+                )
             lines.append("")
         if self.per_category:
             lines.append("## לפי קטגוריה")
@@ -410,6 +439,7 @@ class Row:
     price_override: Optional[float]
     category: str
     upscale_ok: bool = False
+    manual_ok: bool = False  # "אישור ידני": also publishes enlarged images that failed the quality check
 
 
 def map_columns(header: List[str]) -> Dict[str, int]:
@@ -473,7 +503,8 @@ def load_rows(rows: List[List[str]], settings: Dict[str, object], report: Report
                 active=active_raw in YES_VALUES,
                 price_override=to_float(cell(r, "price")),
                 category=norm_category(cell(r, "category")),
-                upscale_ok=cell(r, "upscale_ok").lower() in YES_VALUES,
+                upscale_ok=cell(r, "upscale_ok").lower() in YES_VALUES or cell(r, "upscale_ok") == MANUAL_APPROVAL,
+                manual_ok=cell(r, "upscale_ok") == MANUAL_APPROVAL,
             )
         )
         if not SKU_RE.match(out[-1].group):
@@ -748,6 +779,32 @@ UPSCALE_SIZE = 1024         # square white canvas, side in pixels
 SECONDARY_UPSCALE_GROUPS = {"18890113-1"}  # the group code in column B (טייץ תרמי פרוותי)
 
 
+# Quality check of every enlarged image. Failing either rule marks it "לבדיקה":
+# it stays out of the XML until column O says "אישור ידני".
+QC_MIN_SSIM = 0.90          # SSIM of the enlarged image (shrunk back) against the source
+QC_MIN_SOURCE = 300         # short side of the source, in pixels
+REVIEW_NEW_DAYS = 7         # review.html shows an image by default for this long after it was first enlarged
+
+
+def _open_rgb(data: bytes):
+    """Decode to RGB, flattening transparency onto white (same as the enlarged canvas)."""
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(data))
+    im.load()
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[-1])
+        return bg
+    return im.convert("RGB")
+
+
+def _fit(w: int, h: int, size: int) -> Tuple[int, int]:
+    scale = size / max(w, h)
+    return max(1, round(w * scale)), max(1, round(h * scale))
+
+
 def upscale_to_square(data: bytes, size: int = UPSCALE_SIZE) -> Optional[bytes]:
     """Enlarge an image onto a white square JPEG. Needs Pillow; returns None if unavailable."""
     try:
@@ -755,17 +812,8 @@ def upscale_to_square(data: bytes, size: int = UPSCALE_SIZE) -> Optional[bytes]:
     except ImportError:
         return None
     try:
-        im = Image.open(io.BytesIO(data))
-        im.load()
-        if im.mode in ("RGBA", "LA", "P"):
-            im = im.convert("RGBA")
-            bg = Image.new("RGB", im.size, (255, 255, 255))
-            bg.paste(im, mask=im.split()[-1])
-            im = bg
-        else:
-            im = im.convert("RGB")
-        scale = size / max(im.size)
-        new = (max(1, round(im.width * scale)), max(1, round(im.height * scale)))
+        im = _open_rgb(data)
+        new = _fit(im.width, im.height, size)
         im = im.resize(new, Image.LANCZOS)
         im = im.filter(ImageFilter.UnsharpMask(radius=1.2, percent=60, threshold=3))
         canvas = Image.new("RGB", (size, size), (255, 255, 255))
@@ -777,16 +825,78 @@ def upscale_to_square(data: bytes, size: int = UPSCALE_SIZE) -> Optional[bytes]:
         return None
 
 
-def upscale_image(fetcher, url: str, img_id: str, extra_files: Dict) -> bool:
+def _ssim(a, b) -> float:
+    """Mean SSIM of two grayscale float arrays (7x7 uniform window, like skimage's default)."""
+    import numpy as np
+
+    k, n = 7, 49
+    if min(a.shape) < k:
+        return 1.0 if np.array_equal(a, b) else 0.0
+
+    def box(x):
+        c = np.pad(x.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+        return (c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]) / n
+
+    cov = n / (n - 1)
+    ma, mb = box(a), box(b)
+    va = cov * (box(a * a) - ma * ma)
+    vb = cov * (box(b * b) - mb * mb)
+    vab = cov * (box(a * b) - ma * mb)
+    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+    s = ((2 * ma * mb + c1) * (2 * vab + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2))
+    return float(s.mean())
+
+
+def _laplacian_var(x) -> float:
+    lap = x[1:-1, :-2] + x[1:-1, 2:] + x[:-2, 1:-1] + x[2:, 1:-1] - 4 * x[1:-1, 1:-1]
+    return float(lap.var())
+
+
+def quality_check(src: bytes, enlarged: bytes, size: int = UPSCALE_SIZE) -> Dict[str, object]:
+    """Scores for one enlarged image. Both sharpness and SSIM are measured at the source's scale:
+    the enlarged picture (without its white padding) is shrunk back to the source size first."""
+    try:
+        import numpy as np
+        from PIL import Image
+
+        s = _open_rgb(src)
+        w, h = s.size
+        nw, nh = _fit(w, h, size)
+        x0, y0 = (size - nw) // 2, (size - nh) // 2
+        back = _open_rgb(enlarged).crop((x0, y0, x0 + nw, y0 + nh)).resize((w, h), Image.LANCZOS)
+        a = np.asarray(s.convert("L"), dtype=np.float64)
+        b = np.asarray(back.convert("L"), dtype=np.float64)
+        ssim = _ssim(a, b)
+        lv_src = _laplacian_var(a)
+        sharp = _laplacian_var(b) / lv_src if lv_src > 1e-9 else 1.0
+        reasons = []
+        if ssim < QC_MIN_SSIM:
+            reasons.append(f"SSIM {ssim:.3f} < {QC_MIN_SSIM}")
+        if min(w, h) < QC_MIN_SOURCE:
+            reasons.append(f"מקור {w}x{h} < {QC_MIN_SOURCE}")
+        return {
+            "ssim": round(ssim, 4),
+            "sharpness": round(sharp, 3),
+            "padding": round(100 * (1 - nw * nh / (size * size)), 1),
+            "suspect": bool(reasons),
+            "reasons": reasons,
+        }
+    except Exception as exc:  # cannot verify -> a person has to look at it
+        return {"ssim": None, "sharpness": None, "padding": None, "suspect": True,
+                "reasons": [f"בקרת האיכות לא רצה ({type(exc).__name__})"]}
+
+
+def upscale_image(fetcher, url: str, img_id: str, extra_files: Dict) -> Optional[Dict[str, object]]:
+    """Enlarge one image into extra_files; returns its quality-check scores, or None on failure."""
     try:
         data = fetcher.get(url)
     except FetchError:
-        return False
+        return None
     out = upscale_to_square(data)
     if not out:
-        return False
+        return None
     extra_files[f"images/{img_id}.jpg"] = out
-    return True
+    return quality_check(data, out)
 
 
 def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_url, page_cache=None, extra_files=None) -> List[Item]:
@@ -799,6 +909,14 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
     for r in rows:
         group_counts[r.group] = group_counts.get(r.group, 0) + 1
     approved_groups = {r.group for r in rows if r.upscale_ok}
+    manual_groups = {r.group for r in rows if r.manual_ok}
+    qc_by_image: Dict[str, Optional[Dict[str, object]]] = {}
+
+    def enlarge(img_id: str, url: str) -> Optional[Dict[str, object]]:
+        # Variants share images: enlarge and check each image once per run.
+        if img_id not in qc_by_image:
+            qc_by_image[img_id] = upscale_image(fetcher, url, img_id, extra_files)
+        return qc_by_image[img_id]
 
     for r in rows:
         report.stats["rows"] = report.stats.get("rows", 0) + 1
@@ -868,10 +986,22 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
                 and dims
                 and min(dims) >= MIN_UPSCALE_SOURCE
                 and r.group in approved_groups
-                and (f"images/{img_id}.jpg" in extra_files or upscale_image(fetcher, url_full, img_id, extra_files))
+                and (qc := enlarge(img_id, url_full))
             ):
+                held = qc["suspect"] and r.group not in manual_groups
+                report.add_upscaled(r.sku, img_id, url_full, dims, "ראשית", qc, not held)
+                if held:
+                    # Waits for a person, like any approval: must not trip the safety net.
+                    main_ok = False
+                    report.stats["eligible"] = report.stats.get("eligible", 0) - 1
+                    label_txt = clean_text(r.name) or clean_text((rec or {}).get("PRODUCT_NAME", "")) or r.group
+                    report.approvals.setdefault(
+                        r.group,
+                        f"{r.group} | {label_txt[:60]} | תמונה ראשית מוגדלת לבדיקה ({'; '.join(qc['reasons'])}). "
+                        f"אחרי בדיקה ב-review.html כתוב '{MANUAL_APPROVAL}' | {decode_url(r.url)[:90]}",
+                    )
+                    break
                 images.append(f"{base_url}/images/{img_id}.jpg")
-                report.add_upscaled(r.sku, img_id, url_full, dims, "ראשית")
                 report.warn(
                     f"{r.sku}: התמונה הראשית באתר קטנה ({dims[0]}x{dims[1]}). הוגדלה ל-{UPSCALE_SIZE}x{UPSCALE_SIZE} רק עבור זאפ, באישורך. מומלץ להחליף באתר בתמונה גדולה"
                 )
@@ -881,10 +1011,17 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
                 and min(dims) >= MIN_UPSCALE_SOURCE
                 and r.group in approved_groups
                 and r.group in SECONDARY_UPSCALE_GROUPS
-                and (f"images/{img_id}.jpg" in extra_files or upscale_image(fetcher, url_full, img_id, extra_files))
+                and (qc := enlarge(img_id, url_full))
             ):
+                held = qc["suspect"] and r.group not in manual_groups
+                report.add_upscaled(r.sku, img_id, url_full, dims, "משנית", qc, not held)
+                if held:
+                    report.info(
+                        f"{r.sku}: תמונה משנית {img_id} הוגדלה אבל סומנה לבדיקה ({'; '.join(qc['reasons'])}); "
+                        f"לא נכנסת ל-XML עד '{MANUAL_APPROVAL}' בעמודה O"
+                    )
+                    continue
                 images.append(f"{base_url}/images/{img_id}.jpg")
-                report.add_upscaled(r.sku, img_id, url_full, dims, "משנית")
                 report.info(f"{r.sku}: תמונה משנית {img_id} ({dims[0]}x{dims[1]}) הוגדלה ל-{UPSCALE_SIZE}x{UPSCALE_SIZE}")
             elif k == 0 and dims and min(dims) >= MIN_UPSCALE_SOURCE and r.group not in approved_groups:
                 # Needs the owner's OK first. A business decision, so it must not trip the safety net.
@@ -1069,23 +1206,39 @@ def index_html(categories: List[Tuple[str, str, int]], base_url: str, now: datet
 
 
 def review_html(upscaled: Dict[str, Dict], now: datetime) -> str:
-    """Every image enlarged in this run, shown as it goes into the XML (for the owner, not for Zap)."""
+    """Every image enlarged in this run, shown as it goes into the XML (for the owner, not for Zap).
+    New images and ones still waiting for a manual OK are shown; the rest are folded away."""
     local = israel_now(now)
-    cards = []
+    shown, folded = [], []
     for img_id, e in upscaled.items():
         mine = f"images/{img_id}.jpg"
-        cards.append(
-            '<section class="card">\n'
+        status = _qc_status(e)
+        reasons = f" ({xml_text('; '.join(e['reasons']))})" if e["reasons"] else ""
+        card = (
+            f'<section class="card{" suspect" if e["suspect"] else ""}">\n'
             f"<p>מק\"ט: <b>{xml_text(', '.join(e['skus']))}</b> | סוג: {xml_text(e['kind'])} | "
             f"מזהה תמונה: <code>{xml_text(img_id)}</code> | "
             # <bdi> keeps the RTL order, so the arrow points from "before" to "after".
             f"גודל: <bdi>{xml_text(e['before'])}</bdi> &larr; <bdi>{UPSCALE_SIZE}x{UPSCALE_SIZE}</bdi></p>\n"
+            f"<p>SSIM: <bdi>{_fmt(e['ssim'], 3)}</bdi> | חדות: <bdi>{_fmt(e['sharpness'], 2)}</bdi> | "
+            f"ריפוד: <bdi>{_fmt(e['padding'], 1, '%')}</bdi> | מצב: <b>{xml_text(status)}</b>{reasons}"
+            f"{'' if e['in_xml'] else ' | לא נכנסת ל-XML'}</p>\n"
             f'<img src="{xml_text(mine)}" alt="{xml_text(img_id)}" width="{UPSCALE_SIZE}" height="{UPSCALE_SIZE}">\n'
             f'<p class="links"><a href="{xml_text(mine)}">קובץ מוגדל</a> | '
             f'<a href="{xml_text(e["source"])}" target="_blank" rel="noopener">הצג את המקור</a></p>\n'
             "</section>"
         )
-    body = "\n".join(cards) if cards else "<p>בריצה הזאת לא הוגדלו תמונות.</p>"
+        (shown if e.get("new") or not e["in_xml"] else folded).append(card)
+    if not upscaled:
+        body = "<p>בריצה הזאת לא הוגדלו תמונות.</p>"
+    else:
+        body = "\n".join(shown) if shown else "<p>אין תמונות חדשות או ממתינות לבדיקה.</p>"
+        if folded:
+            body += (
+                f"\n<details><summary>תמונות תקינות שכבר נבדקו ({len(folded)})</summary>\n"
+                + "\n".join(folded)
+                + "\n</details>"
+            )
     return (
         '<!DOCTYPE html>\n<html lang="he" dir="rtl">\n<head>\n<meta charset="UTF-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
@@ -1096,7 +1249,7 @@ def review_html(upscaled: Dict[str, Dict], now: datetime) -> str:
         f"img{{display:block;width:{UPSCALE_SIZE}px;height:{UPSCALE_SIZE}px;max-width:100%;border:1px solid #eee}}"
         # Narrower than the image: keep it square instead of stretching it.
         f"@media (max-width:{UPSCALE_SIZE + 32}px){{img{{height:auto;aspect-ratio:1/1}}}}"
-        ".links{font-size:small}</style>\n"
+        ".links{font-size:small}.suspect{border-color:#c00}summary{cursor:pointer;margin:16px 0}</style>\n"
         "</head>\n<body>\n"
         f"<h1>{STORE_NAME}: תמונות שהוגדלו ({len(upscaled)})</h1>\n<p>עודכן: {local:%d/%m/%Y %H:%M}</p>\n"
         f"{body}\n</body>\n</html>\n"
@@ -1250,6 +1403,16 @@ def run(
         files[f"products/{it.row.sku}.xml"] = product_xml(it, settings, terms)
     files["index.html"] = index_html(cats_for_index, base_url, now)
     files["index.xml"] = index_xml(cats_for_index, base_url, now)
+    # When each enlarged image was first seen, so review.html can tell new images from checked ones.
+    seen_path = os.path.join(cache_dir, "upscaled_seen.json")
+    try:
+        with open(seen_path, encoding="utf-8") as fh:
+            seen: Dict[str, str] = json.load(fh)
+    except (OSError, ValueError):
+        seen = {}
+    for img_id, e in report.upscaled.items():
+        first = datetime.fromisoformat(seen.setdefault(img_id, now.isoformat()))
+        e["new"] = now - first < timedelta(days=REVIEW_NEW_DAYS)
     files["review.html"] = review_html(report.upscaled, now)
 
     write_site(out_dir, files)
@@ -1259,6 +1422,8 @@ def run(
         json.dump(img_cache, fh)
     with open(state_path, "w", encoding="utf-8") as fh:
         json.dump({"published": len(final)}, fh)
+    with open(seen_path, "w", encoding="utf-8") as fh:
+        json.dump(seen, fh)
     os.makedirs(report_dir, exist_ok=True)
     with open(os.path.join(report_dir, "report.md"), "w", encoding="utf-8") as fh:
         fh.write(report.to_markdown())

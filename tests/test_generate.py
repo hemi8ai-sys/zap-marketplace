@@ -254,8 +254,10 @@ class Tests(unittest.TestCase):
         info = ET.parse(os.path.join(tmp, "site", "products", "A-1.xml")).getroot()
         self.assertTrue(info.find("./Images/Image").get("url").startswith("https://example.test/zap/images/"))
 
-    def _run_secondary(self, size, approve="כן", groups=("G1",)):
-        """Main image is fine (1024); the secondary IMG2 is a real JPEG of `size`."""
+    def _run_secondary(self, size, approve="כן", groups=("G1",), patches=None, seen=None):
+        """Main image is fine (1024); the secondary IMG2 is a real JPEG of `size`.
+        `patches` overrides module constants (e.g. the quality-check thresholds);
+        `seen` pre-fills the cache of when each enlarged image was first seen."""
         try:
             from PIL import Image
         except ImportError:
@@ -274,9 +276,15 @@ class Tests(unittest.TestCase):
                 return super().get(url, max_bytes)
 
         tmp = tempfile.mkdtemp()
+        if seen:
+            import json
+
+            os.makedirs(os.path.join(tmp, "cache"))
+            with open(os.path.join(tmp, "cache", "upscaled_seen.json"), "w", encoding="utf-8") as fh:
+                json.dump(seen, fh)
         data = {"settings": SETTINGS, "products": [HEAD, prow("A-1", "M", 3, approve=approve), prow("A-2", "L", 3)],
                 "sales": [["h"]]}
-        with mock.patch.object(g, "SECONDARY_UPSCALE_GROUPS", set(groups)):
+        with mock.patch.multiple(g, SECONDARY_UPSCALE_GROUPS=set(groups), **(patches or {})):
             rep = g.run(SmallSecond(), "x", {"products": 1, "settings": 2, "sales": 3},
                         "https://www.hdsale.co.il/mirrors/zap/catalog.xml", "https://example.test/zap",
                         os.path.join(tmp, "site"), os.path.join(tmp, "rep"), os.path.join(tmp, "cache"),
@@ -337,6 +345,127 @@ class Tests(unittest.TestCase):
         _, site = run_with([prow("A-1", "M", 3)])
         review = open(os.path.join(site, "review.html"), encoding="utf-8").read()
         self.assertIn("לא הוגדלו", review)
+
+    # ---- quality check of enlarged images ----
+
+    def test_ssim_known_values(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy not installed")
+        a = np.tile(np.linspace(0, 255, 64), (64, 1))
+        self.assertAlmostEqual(g._ssim(a, a), 1.0, places=6)
+        self.assertLess(g._ssim(a, 255 - a), 0.0)
+
+    def test_quality_check_scores(self):
+        try:
+            from PIL import Image
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow/numpy not installed")
+        import io
+
+        buf = io.BytesIO()
+        Image.new("RGB", (600, 500), (30, 30, 200)).save(buf, "JPEG")
+        src = buf.getvalue()
+        qc = g.quality_check(src, g.upscale_to_square(src))
+        self.assertGreater(qc["ssim"], 0.99)
+        self.assertFalse(qc["suspect"])
+        self.assertEqual(qc["padding"], 16.7)  # 1024x853 picture on a 1024x1024 canvas
+        self.assertIsNotNone(qc["sharpness"])
+
+    def test_good_secondary_is_marked_ok(self):
+        rep, _site, urls, review = self._run_secondary((600, 500))
+        e = rep.upscaled[IMG2]
+        self.assertFalse(e["suspect"])
+        self.assertTrue(e["in_xml"])
+        self.assertEqual(len(urls), 2)
+        md = rep.to_markdown()
+        self.assertIn('| מק"ט | תמונה | סוג | SSIM | חדות | ריפוד | מצב |', md)
+        self.assertIn(f"`{IMG2}`", md)
+        self.assertIn("| תקין |", md)
+        self.assertIn("SSIM:", review)
+
+    def test_suspect_secondary_held_until_manual_approval(self):
+        rep, _site, urls, review = self._run_secondary((600, 500), patches={"QC_MIN_SSIM": 1.01})
+        self.assertTrue(rep.upscaled[IMG2]["suspect"])
+        self.assertFalse(rep.upscaled[IMG2]["in_xml"])
+        self.assertEqual(len(urls), 1)               # out of the XML ...
+        self.assertEqual(rep.stats["published"], 2)  # ... but the product is still published
+        self.assertIn("| לבדיקה |", rep.to_markdown())
+        self.assertIn("לא נכנסת ל-XML", review)
+
+        rep, _site, urls, _ = self._run_secondary((600, 500), approve="אישור ידני", patches={"QC_MIN_SSIM": 1.01})
+        self.assertTrue(rep.upscaled[IMG2]["in_xml"])
+        self.assertEqual(urls[1], f"https://example.test/zap/images/{IMG2}.jpg")
+        self.assertIn("| לבדיקה (אישור ידני) |", rep.to_markdown())
+
+    def test_small_source_threshold_is_a_constant(self):
+        rep, _site, urls, _ = self._run_secondary((600, 500), patches={"QC_MIN_SOURCE": 550})
+        self.assertTrue(rep.upscaled[IMG2]["suspect"])
+        self.assertTrue(any("550" in r for r in rep.upscaled[IMG2]["reasons"]))
+        self.assertEqual(len(urls), 1)
+
+    def test_suspect_main_image_holds_product(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        import io
+        from unittest import mock
+
+        buf = io.BytesIO()
+        Image.new("RGB", (600, 580), (200, 30, 30)).save(buf, "JPEG")
+        small_jpg = buf.getvalue()
+
+        class RealSmall(FakeFetcher):
+            def get(self, url, max_bytes=None):
+                if url.endswith(".jpg") and "ecdn" in url:
+                    return small_jpg
+                return super().get(url, max_bytes)
+
+        def go(approve):
+            tmp = tempfile.mkdtemp()
+            data = {"settings": SETTINGS, "products": [HEAD, prow("A-1", "M", 3, approve=approve)], "sales": [["h"]]}
+            with mock.patch.object(g, "QC_MIN_SSIM", 1.01):
+                return g.run(RealSmall(), "x", {"products": 1, "settings": 2, "sales": 3},
+                             "https://www.hdsale.co.il/mirrors/zap/catalog.xml", "https://example.test/zap",
+                             os.path.join(tmp, "site"), os.path.join(tmp, "rep"), os.path.join(tmp, "cache"),
+                             os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "terms.txt"),
+                             sheet_reader=lambda n: data[n])
+
+        rep = go("כן")
+        self.assertEqual(rep.stats["published"], 0)
+        self.assertIn("אישור ידני", rep.approvals["G1"])
+        rep = go("אישור ידני")
+        self.assertEqual(rep.stats["published"], 1)
+        self.assertEqual(rep.approvals, {})
+
+    def test_review_shows_new_or_suspect_by_default(self):
+        def entry(suspect, in_xml, new):
+            return {"skus": ["A-1"], "source": "https://ecdn.crosphera.net/x.jpg", "before": "500x500",
+                    "kind": "משנית", "in_xml": in_xml, "new": new, "ssim": 0.95, "sharpness": 1.1,
+                    "padding": 0.0, "suspect": suspect, "reasons": ["SSIM"] if suspect else []}
+
+        page = g.review_html({"old-ok": entry(False, True, False), "new-ok": entry(False, True, True),
+                              "held": entry(True, False, False)}, g.datetime.now(g.timezone.utc))
+        shown, folded = page.split("<details>")
+        self.assertIn("new-ok", shown)
+        self.assertIn("held", shown)
+        self.assertNotIn("old-ok", shown)
+        self.assertIn("old-ok", folded)
+
+    def test_review_new_mark_expires(self):
+        rep, site, _urls, review = self._run_secondary((600, 500))
+        self.assertTrue(rep.upscaled[IMG2]["new"])
+        cache = os.path.join(os.path.dirname(site), "cache", "upscaled_seen.json")
+        self.assertIn(IMG2, open(cache, encoding="utf-8").read())
+
+        long_ago = (g.datetime.now(g.timezone.utc) - g.timedelta(days=g.REVIEW_NEW_DAYS + 1)).isoformat()
+        rep, _site, _urls, review = self._run_secondary((600, 500), seen={IMG2: long_ago})
+        self.assertFalse(rep.upscaled[IMG2]["new"])
+        self.assertIn("<details>", review)
+        self.assertNotIn(IMG2, review.split("<details>")[0])
 
 
 if __name__ == "__main__":
