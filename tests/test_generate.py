@@ -247,17 +247,19 @@ class Tests(unittest.TestCase):
                     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "terms.txt"),
                     sheet_reader=lambda n: data[n])
         self.assertEqual(rep.stats["published"], 1)
-        files = os.listdir(os.path.join(tmp, "site", "images"))
-        self.assertEqual(len(files), 1)
-        im = Image.open(os.path.join(tmp, "site", "images", files[0]))
-        self.assertEqual(im.size, (1024, 1024))
+        # Every image is 600x580 here, so with approval the secondary one is enlarged too.
+        files = sorted(os.listdir(os.path.join(tmp, "site", "images")))
+        self.assertEqual(files, [f"{IMG1}.jpg", f"{IMG2}.jpg"])
+        for f in files:
+            self.assertEqual(Image.open(os.path.join(tmp, "site", "images", f)).size, (1024, 1024))
         info = ET.parse(os.path.join(tmp, "site", "products", "A-1.xml")).getroot()
         self.assertTrue(info.find("./Images/Image").get("url").startswith("https://example.test/zap/images/"))
 
-    def _run_secondary(self, size, approve="כן", groups=("G1",), patches=None, seen=None):
+    def _run_secondary(self, size, approve="כן", patches=None, seen=None, rows=None):
         """Main image is fine (1024); the secondary IMG2 is a real JPEG of `size`.
         `patches` overrides module constants (e.g. the quality-check thresholds);
-        `seen` pre-fills the cache of when each enlarged image was first seen."""
+        `seen` pre-fills the cache of when each enlarged image was first seen;
+        `rows` replaces the default two variants A-1/A-2 (then `urls` is None if A-1 isn't published)."""
         try:
             from PIL import Image
         except ImportError:
@@ -282,20 +284,21 @@ class Tests(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "cache"))
             with open(os.path.join(tmp, "cache", "upscaled_seen.json"), "w", encoding="utf-8") as fh:
                 json.dump(seen, fh)
-        data = {"settings": SETTINGS, "products": [HEAD, prow("A-1", "M", 3, approve=approve), prow("A-2", "L", 3)],
-                "sales": [["h"]]}
-        with mock.patch.multiple(g, SECONDARY_UPSCALE_GROUPS=set(groups), **(patches or {})):
+        rows = rows or [prow("A-1", "M", 3, approve=approve), prow("A-2", "L", 3)]
+        data = {"settings": SETTINGS, "products": [HEAD] + rows, "sales": [["h"]]}
+        with mock.patch.multiple(g, **(patches or {"QC_MIN_SSIM": g.QC_MIN_SSIM})):
             rep = g.run(SmallSecond(), "x", {"products": 1, "settings": 2, "sales": 3},
                         "https://www.hdsale.co.il/mirrors/zap/catalog.xml", "https://example.test/zap",
                         os.path.join(tmp, "site"), os.path.join(tmp, "rep"), os.path.join(tmp, "cache"),
                         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "terms.txt"),
                         sheet_reader=lambda n: data[n])
         site = os.path.join(tmp, "site")
-        urls = [i.get("url") for i in ET.parse(os.path.join(site, "products", "A-1.xml")).getroot().findall("./Images/Image")]
+        a1 = os.path.join(site, "products", "A-1.xml")
+        urls = [i.get("url") for i in ET.parse(a1).getroot().findall("./Images/Image")] if os.path.exists(a1) else None
         review = open(os.path.join(site, "review.html"), encoding="utf-8").read()
         return rep, site, urls, review
 
-    def test_secondary_image_upscaled_for_trial_group(self):
+    def test_secondary_image_upscaled_when_approved(self):
         from PIL import Image
 
         rep, site, urls, review = self._run_secondary((600, 500))
@@ -319,13 +322,18 @@ class Tests(unittest.TestCase):
         self.assertIn("הצג את המקור", review)
         self.assertIn("משנית", review)
 
-    def test_secondary_image_not_upscaled_outside_trial(self):
-        rep, site, urls, review = self._run_secondary((600, 500), groups=("18890113",))
-        self.assertEqual(rep.stats["published"], 2)
-        self.assertEqual(len(urls), 1)
-        self.assertFalse(os.path.exists(os.path.join(site, "images")))
-        self.assertEqual(rep.upscaled, {})
-        self.assertIn("לא הוגדלו", review)
+    def test_thresholds(self):
+        self.assertEqual(g.MIN_UPSCALE_SOURCE, 400)
+        self.assertEqual(g.MIN_UPSCALE_SOURCE_SECONDARY, 250)
+        self.assertEqual(g.QC_MIN_SOURCE, 250)
+        self.assertEqual(g.QC_MIN_SSIM, 0.90)
+        self.assertFalse(hasattr(g, "SECONDARY_UPSCALE_GROUPS"))
+
+    def test_secondary_from_250_is_upscaled(self):
+        rep, site, urls, review = self._run_secondary((260, 300))
+        self.assertEqual(len(urls), 2)
+        self.assertFalse(rep.upscaled[IMG2]["suspect"])  # 260 >= QC_MIN_SOURCE
+        self.assertEqual(rep.replace, {})
 
     def test_secondary_image_needs_approval(self):
         rep, site, urls, _ = self._run_secondary((600, 500), approve="")
@@ -333,13 +341,59 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(urls), 1)
         self.assertEqual(rep.upscaled, {})
         self.assertFalse(rep.approvals)  # a skipped secondary never holds the product back
+        e = rep.replace[IMG2]
+        self.assertEqual(e["skus"], ["A-1", "A-2"])
+        self.assertEqual(e["size"], "600x500")
+        self.assertIn("לא אושרה", e["reason"])
+        self.assertEqual(e["url"], "https://www.hdsale.co.il/p/shirt")
 
-    def test_secondary_image_below_400_dropped(self):
-        rep, site, urls, _ = self._run_secondary((390, 500))
+    def test_secondary_image_below_250_dropped_and_listed(self):
+        rep, site, urls, _ = self._run_secondary((240, 500))
         self.assertEqual(rep.stats["published"], 2)
         self.assertEqual(len(urls), 1)
         self.assertEqual(rep.upscaled, {})
-        self.assertTrue(any("390x500" in m for m in rep.infos))
+        self.assertTrue(any("240x500" in m for m in rep.infos))
+        self.assertIn("250", rep.replace[IMG2]["reason"])
+        md = rep.to_markdown()
+        self.assertIn("## תמונות להחלפה באתר (1)", md)
+        self.assertIn('| מק"ט | תמונה | גודל | סיבה | דף המוצר |', md)
+        self.assertIn(f"`{IMG2}` | 240x500 |", md)
+        self.assertIn("(<https://www.hdsale.co.il/p/shirt>)", md)
+
+    def test_replacements_cover_inactive_products(self):
+        rep, _site, urls, _ = self._run_secondary((600, 500), rows=[prow("B-1", "M", 3, active="לא", approve="כן")])
+        self.assertIsNone(urls)
+        self.assertEqual(rep.stats["published"], 0)
+        self.assertEqual(rep.replace[IMG2]["skus"], ["B-1"])
+        self.assertEqual(rep.replace[IMG2]["reason"], "לא הוגדלה")  # approved, but the product isn't published
+
+    def test_main_image_still_needs_400(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        import io
+
+        buf = io.BytesIO()
+        Image.new("RGB", (300, 300), (200, 30, 30)).save(buf, "JPEG")
+        small_jpg = buf.getvalue()
+
+        class RealSmall(FakeFetcher):
+            def get(self, url, max_bytes=None):
+                if url.endswith(".jpg") and "ecdn" in url and IMG1 in url:
+                    return small_jpg
+                return super().get(url, max_bytes)
+
+        tmp = tempfile.mkdtemp()
+        data = {"settings": SETTINGS, "products": [HEAD, prow("A-1", "M", 3, approve="כן")], "sales": [["h"]]}
+        rep = g.run(RealSmall(), "x", {"products": 1, "settings": 2, "sales": 3},
+                    "https://www.hdsale.co.il/mirrors/zap/catalog.xml", "https://example.test/zap",
+                    os.path.join(tmp, "site"), os.path.join(tmp, "rep"), os.path.join(tmp, "cache"),
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "terms.txt"),
+                    sheet_reader=lambda n: data[n])
+        self.assertEqual(rep.stats["published"], 0)
+        self.assertEqual(rep.upscaled, {})
+        self.assertTrue(any("300x300" in e for e in rep.errors))
 
     def test_review_page_built_every_run(self):
         _, site = run_with([prow("A-1", "M", 3)])

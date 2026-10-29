@@ -286,6 +286,7 @@ class Report:
     per_category: Dict[str, int] = field(default_factory=dict)
     approvals: Dict[str, str] = field(default_factory=dict)  # product group -> text; waiting for the owner's OK
     upscaled: Dict[str, Dict] = field(default_factory=dict)  # image id -> details for review.html
+    replace: Dict[str, Dict] = field(default_factory=dict)   # image id -> secondary image to replace on the store's site
 
     def add_upscaled(self, sku: str, img_id: str, source: str, dims: Tuple[int, int], kind: str,
                      qc: Dict[str, object], in_xml: bool) -> None:
@@ -343,6 +344,21 @@ class Report:
                     f"{_fmt(e['sharpness'], 2)} | {_fmt(e['padding'], 1, '%')} | {_qc_status(e)} |"
                 )
             lines.append("")
+        if self.replace:
+            lines.append(f"## תמונות להחלפה באתר ({len(self.replace)})")
+            lines.append(
+                f"תמונות משניות שלא נכנסות לזאפ: קטנות מ-{MIN_IMAGE_SIDE} ולא הוגדלו. "
+                f"מתחת ל-{MIN_UPSCALE_SOURCE_SECONDARY} אי אפשר להגדיל; מעל זה אפשר לאשר הגדלה ב-'כן' בעמודה O, "
+                "או להעלות לאתר תמונה גדולה יותר. כולל את כל המוצרים בגיליון, גם לא פעילים."
+            )
+            lines.append("")
+            lines.append('| מק"ט | תמונה | גודל | סיבה | דף המוצר |')
+            lines.append("|---|---|---|---|---|")
+            for img_id, e in self.replace.items():
+                lines.append(
+                    f"| {', '.join(e['skus'])} | `{img_id}` | {e['size']} | {e['reason']} | [קישור](<{e['url']}>) |"
+                )
+            lines.append("")
         if self.per_category:
             lines.append("## לפי קטגוריה")
             for cat, n in sorted(self.per_category.items()):
@@ -364,6 +380,7 @@ class Report:
                 "warnings": self.warnings,
                 "infos": self.infos,
                 "upscaled": self.upscaled,
+                "replace": self.replace,
             },
             ensure_ascii=False,
             indent=2,
@@ -773,16 +790,15 @@ def choose_url(url: str, report: Report, sku: str) -> str:
     return best
 
 
-MIN_UPSCALE_SOURCE = 400    # smaller sources are too poor to enlarge
-UPSCALE_SIZE = 1024         # square white canvas, side in pixels
-# Trial: secondary images are enlarged only for these product groups (still needs "כן" in column O).
-SECONDARY_UPSCALE_GROUPS = {"18890113-1"}  # the group code in column B (טייץ תרמי פרוותי)
+MIN_UPSCALE_SOURCE = 400            # main image: smaller sources are too poor to enlarge
+MIN_UPSCALE_SOURCE_SECONDARY = 250  # secondary images (short side); smaller ones stay out of the XML
+UPSCALE_SIZE = 1024                 # square white canvas, side in pixels
 
 
 # Quality check of every enlarged image. Failing either rule marks it "לבדיקה":
 # it stays out of the XML until column O says "אישור ידני".
 QC_MIN_SSIM = 0.90          # SSIM of the enlarged image (shrunk back) against the source
-QC_MIN_SOURCE = 300         # short side of the source, in pixels
+QC_MIN_SOURCE = 250         # short side of the source, in pixels
 REVIEW_NEW_DAYS = 7         # review.html shows an image by default for this long after it was first enlarged
 
 
@@ -899,6 +915,66 @@ def upscale_image(fetcher, url: str, img_id: str, extra_files: Dict) -> Optional
     return quality_check(data, out)
 
 
+EMPTY_PAGE = {"description": "", "price": None, "image_ids": [], "base": None, "og_image_id": None, "body_description": ""}
+
+
+def product_image_ids(rec, page) -> Tuple[Optional[str], List[str]]:
+    """(image base, [main id, secondary ids...]); no ids if the product has no usable image."""
+    main_id = None
+    base = page.get("base")
+    if rec and rec.get("IMAGE"):
+        m = re.search(r"crosphera\.net/([0-9a-f]{24})/([0-9a-f]{24})\.", rec["IMAGE"])
+        if m:
+            base, main_id = m.group(1), m.group(2)
+    if not main_id:
+        main_id = page.get("og_image_id") or (page["image_ids"][0] if page["image_ids"] else None)
+    if not main_id or not base:
+        return base, []
+    return base, [main_id] + [i for i in page["image_ids"] if i != main_id]
+
+
+def collect_replacements(rows, feed, fetcher, report, img_cache, page_cache) -> None:
+    """Every secondary image, of every product in the sheet, that is neither big enough for Zap
+    nor enlarged: the store should replace it on its own site."""
+    checker = ImageChecker(fetcher, img_cache)
+    approved_groups = {r.group for r in rows if r.upscale_ok}
+    by_url: Dict[str, List[Row]] = {}
+    for r in rows:
+        if r.url:
+            by_url.setdefault(r.url, []).append(r)
+    for url, group_rows in by_url.items():
+        page = page_cache.get(url)
+        if url not in page_cache:
+            try:
+                page = parse_page(fetcher.get(url).decode("utf-8", errors="replace"))
+            except FetchError:
+                page = None
+            page_cache[url] = page
+        base, ids = product_image_ids(feed.find(url), page or dict(EMPTY_PAGE))
+        skus = [r.sku for r in group_rows]
+        approved = any(r.group in approved_groups for r in group_rows)
+        for img_id in ids[1:]:
+            if img_id in report.upscaled:
+                continue  # enlarged (the quality-check table covers it)
+            dims = checker.size(f"https://ecdn.crosphera.net/{base}/{img_id}.jpg")
+            if dims and min(dims) >= MIN_IMAGE_SIDE:
+                continue
+            if not dims:
+                reason = "לא נקראה"
+            elif min(dims) < MIN_UPSCALE_SOURCE_SECONDARY:
+                reason = f"קטנה מ-{MIN_UPSCALE_SOURCE_SECONDARY}"
+            elif not approved:
+                reason = "הגדלה לא אושרה (עמודה O)"
+            else:
+                reason = "לא הוגדלה"  # approved and big enough, but not reached (product not published, or 4 images already)
+            report.replace.setdefault(img_id, {
+                "skus": skus,
+                "size": f"{dims[0]}x{dims[1]}" if dims else "-",
+                "reason": reason,
+                "url": decode_url(url),
+            })
+
+
 def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_url, page_cache=None, extra_files=None) -> List[Item]:
     extra_files = {} if extra_files is None else extra_files
     checker = ImageChecker(fetcher, img_cache)
@@ -946,7 +1022,7 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
                 page = None
                 report.warn(f"{r.sku}: עמוד המוצר לא נטען ({exc}); משתמשים בנתוני הפיד בלבד")
             page_cache[r.url] = page
-        page = page or {"description": "", "price": None, "image_ids": [], "base": None, "og_image_id": None, "body_description": ""}
+        page = page or dict(EMPTY_PAGE)
 
         # price
         price = r.price_override
@@ -960,18 +1036,10 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
             continue
 
         # images
-        main_id = None
-        base = page.get("base")
-        if rec and rec.get("IMAGE"):
-            m = re.search(r"crosphera\.net/([0-9a-f]{24})/([0-9a-f]{24})\.", rec["IMAGE"])
-            if m:
-                base, main_id = m.group(1), m.group(2)
-        if not main_id:
-            main_id = page.get("og_image_id") or (page["image_ids"][0] if page["image_ids"] else None)
-        if not main_id or not base:
+        base, ids = product_image_ids(rec, page)
+        if not ids:
             report.error(f"שורה {r.line} ({r.sku}): לא נמצאה תמונה למוצר")
             continue
-        ids = [main_id] + [i for i in page["image_ids"] if i != main_id]
         images: List[str] = []
         main_ok = True
         for k, img_id in enumerate(ids[: MAX_IMAGES + 4]):
@@ -1008,9 +1076,8 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
             elif (
                 k > 0
                 and dims
-                and min(dims) >= MIN_UPSCALE_SOURCE
+                and min(dims) >= MIN_UPSCALE_SOURCE_SECONDARY
                 and r.group in approved_groups
-                and r.group in SECONDARY_UPSCALE_GROUPS
                 and (qc := enlarge(img_id, url_full))
             ):
                 held = qc["suspect"] and r.group not in manual_groups
@@ -1354,11 +1421,14 @@ def run(
         pass
 
     extra_files: Dict[str, bytes] = {}
+    page_cache: Dict[str, Optional[Dict]] = {}
     if settings["pause"]:
         items = []
         report.warn("פרסום מושבת (ההגדרה 'השבתת פרסום' = כן): המרקטפלייס מפורסם ריק בכוונה")
     else:
-        items = build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_url, extra_files=extra_files)
+        items = build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_url,
+                            page_cache=page_cache, extra_files=extra_files)
+    collect_replacements(rows, feed, fetcher, report, img_cache, page_cache)
 
     final: List[Item] = []
     for it in items:
