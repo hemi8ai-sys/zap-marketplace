@@ -1078,7 +1078,8 @@ def review_html(upscaled: Dict[str, Dict], now: datetime) -> str:
             '<section class="card">\n'
             f"<p>מק\"ט: <b>{xml_text(', '.join(e['skus']))}</b> | סוג: {xml_text(e['kind'])} | "
             f"מזהה תמונה: <code>{xml_text(img_id)}</code> | "
-            f"גודל: {xml_text(e['before'])} &larr; {UPSCALE_SIZE}x{UPSCALE_SIZE}</p>\n"
+            # <bdi> keeps the RTL order, so the arrow points from "before" to "after".
+            f"גודל: <bdi>{xml_text(e['before'])}</bdi> &larr; <bdi>{UPSCALE_SIZE}x{UPSCALE_SIZE}</bdi></p>\n"
             f'<img src="{xml_text(mine)}" alt="{xml_text(img_id)}" width="{UPSCALE_SIZE}" height="{UPSCALE_SIZE}">\n'
             f'<p class="links"><a href="{xml_text(mine)}">קובץ מוגדל</a> | '
             f'<a href="{xml_text(e["source"])}" target="_blank" rel="noopener">הצג את המקור</a></p>\n'
