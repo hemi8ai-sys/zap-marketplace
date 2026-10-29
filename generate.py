@@ -1069,21 +1069,20 @@ def index_html(categories: List[Tuple[str, str, int]], base_url: str, now: datet
 
 
 def review_html(upscaled: Dict[str, Dict], now: datetime) -> str:
-    """Original next to enlarged, for every image enlarged in this run (for the owner, not for Zap)."""
+    """Every image enlarged in this run, shown as it goes into the XML (for the owner, not for Zap)."""
     local = israel_now(now)
     cards = []
     for img_id, e in upscaled.items():
         mine = f"images/{img_id}.jpg"
         cards.append(
             '<section class="card">\n'
-            f"<h2>{xml_text(', '.join(e['skus']))} <small>(תמונה {xml_text(e['kind'])})</small></h2>\n"
-            f"<p>מזהה תמונה: <code>{xml_text(img_id)}</code> | לפני: {xml_text(e['before'])} | "
-            f"אחרי: {UPSCALE_SIZE}x{UPSCALE_SIZE} | <a href=\"{xml_text(mine)}\">קובץ מוגדל</a> | "
-            f"<a href=\"{xml_text(e['source'])}\">מקור</a></p>\n"
-            '<div class="pair">\n'
-            f'<figure><img src="{xml_text(e["source"])}" alt="מקור"><figcaption>מקור ({xml_text(e["before"])})</figcaption></figure>\n'
-            f'<figure><img src="{xml_text(mine)}" alt="מוגדלת"><figcaption>מוגדלת ({UPSCALE_SIZE}x{UPSCALE_SIZE})</figcaption></figure>\n'
-            "</div>\n</section>"
+            f"<p>מק\"ט: <b>{xml_text(', '.join(e['skus']))}</b> | סוג: {xml_text(e['kind'])} | "
+            f"מזהה תמונה: <code>{xml_text(img_id)}</code> | "
+            f"גודל: {xml_text(e['before'])} &larr; {UPSCALE_SIZE}x{UPSCALE_SIZE}</p>\n"
+            f'<img src="{xml_text(mine)}" alt="{xml_text(img_id)}" width="{UPSCALE_SIZE}" height="{UPSCALE_SIZE}">\n'
+            f'<p class="links"><a href="{xml_text(mine)}">קובץ מוגדל</a> | '
+            f'<a href="{xml_text(e["source"])}" target="_blank" rel="noopener">הצג את המקור</a></p>\n'
+            "</section>"
         )
     body = "\n".join(cards) if cards else "<p>בריצה הזאת לא הוגדלו תמונות.</p>"
     return (
@@ -1093,8 +1092,10 @@ def review_html(upscaled: Dict[str, Dict], now: datetime) -> str:
         f"<title>{STORE_NAME} | בדיקת תמונות מוגדלות</title>\n"
         "<style>body{font-family:sans-serif;margin:16px;background:#fff;color:#111}"
         ".card{border:1px solid #ccc;padding:12px;margin-bottom:16px}"
-        ".pair{display:flex;gap:12px;flex-wrap:wrap}figure{margin:0;flex:1 1 300px}"
-        "img{width:100%;height:auto;border:1px solid #eee;background:#fafafa}</style>\n"
+        f"img{{display:block;width:{UPSCALE_SIZE}px;height:{UPSCALE_SIZE}px;max-width:100%;border:1px solid #eee}}"
+        # Narrower than the image: keep it square instead of stretching it.
+        f"@media (max-width:{UPSCALE_SIZE + 32}px){{img{{height:auto;aspect-ratio:1/1}}}}"
+        ".links{font-size:small}</style>\n"
         "</head>\n<body>\n"
         f"<h1>{STORE_NAME}: תמונות שהוגדלו ({len(upscaled)})</h1>\n<p>עודכן: {local:%d/%m/%Y %H:%M}</p>\n"
         f"{body}\n</body>\n</html>\n"

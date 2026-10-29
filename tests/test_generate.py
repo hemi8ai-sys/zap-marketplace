@@ -303,6 +303,13 @@ class Tests(unittest.TestCase):
         self.assertIn("1024x1024", review)
         self.assertIn(f"images/{IMG2}.jpg", review)
         self.assertIn(f"https://ecdn.crosphera.net/{BASE}/{IMG2}.jpg", review)
+        # Only the enlarged image is shown, as an exact 1024 square; the source is a link only.
+        self.assertEqual(review.count("<img "), 1)
+        self.assertIn(f'<img src="images/{IMG2}.jpg"', review)
+        self.assertIn("width:1024px;height:1024px;max-width:100%", review)
+        self.assertIn('target="_blank"', review)
+        self.assertIn("הצג את המקור", review)
+        self.assertIn("משנית", review)
 
     def test_secondary_image_not_upscaled_outside_trial(self):
         rep, site, urls, review = self._run_secondary((600, 500), groups=("18890113",))
