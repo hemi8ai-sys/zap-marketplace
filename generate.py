@@ -274,6 +274,15 @@ class Report:
     stats: Dict[str, int] = field(default_factory=dict)
     per_category: Dict[str, int] = field(default_factory=dict)
     approvals: Dict[str, str] = field(default_factory=dict)  # product group -> text; waiting for the owner's OK
+    upscaled: Dict[str, Dict] = field(default_factory=dict)  # image id -> details for review.html
+
+    def add_upscaled(self, sku: str, img_id: str, source: str, dims: Tuple[int, int], kind: str) -> None:
+        # Variants of one product share images: one entry per image, listing every SKU.
+        entry = self.upscaled.setdefault(
+            img_id, {"skus": [], "source": source, "before": f"{dims[0]}x{dims[1]}", "kind": kind}
+        )
+        if sku not in entry["skus"]:
+            entry["skus"].append(sku)
 
     def error(self, msg: str) -> None:
         self.errors.append(msg)
@@ -325,6 +334,7 @@ class Report:
                 "errors": self.errors,
                 "warnings": self.warnings,
                 "infos": self.infos,
+                "upscaled": self.upscaled,
             },
             ensure_ascii=False,
             indent=2,
@@ -734,6 +744,8 @@ def choose_url(url: str, report: Report, sku: str) -> str:
 
 MIN_UPSCALE_SOURCE = 400    # smaller sources are too poor to enlarge
 UPSCALE_SIZE = 1024         # square white canvas, side in pixels
+# Trial: secondary images are enlarged only for these product groups (still needs "כן" in column O).
+SECONDARY_UPSCALE_GROUPS = {"18890113"}
 
 
 def upscale_to_square(data: bytes, size: int = UPSCALE_SIZE) -> Optional[bytes]:
@@ -765,7 +777,7 @@ def upscale_to_square(data: bytes, size: int = UPSCALE_SIZE) -> Optional[bytes]:
         return None
 
 
-def upscale_main(fetcher, url: str, img_id: str, extra_files: Dict) -> bool:
+def upscale_image(fetcher, url: str, img_id: str, extra_files: Dict) -> bool:
     try:
         data = fetcher.get(url)
     except FetchError:
@@ -856,12 +868,24 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
                 and dims
                 and min(dims) >= MIN_UPSCALE_SOURCE
                 and r.group in approved_groups
-                and (f"images/{img_id}.jpg" in extra_files or upscale_main(fetcher, url_full, img_id, extra_files))
+                and (f"images/{img_id}.jpg" in extra_files or upscale_image(fetcher, url_full, img_id, extra_files))
             ):
                 images.append(f"{base_url}/images/{img_id}.jpg")
+                report.add_upscaled(r.sku, img_id, url_full, dims, "ראשית")
                 report.warn(
                     f"{r.sku}: התמונה הראשית באתר קטנה ({dims[0]}x{dims[1]}). הוגדלה ל-{UPSCALE_SIZE}x{UPSCALE_SIZE} רק עבור זאפ, באישורך. מומלץ להחליף באתר בתמונה גדולה"
                 )
+            elif (
+                k > 0
+                and dims
+                and min(dims) >= MIN_UPSCALE_SOURCE
+                and r.group in approved_groups
+                and r.group in SECONDARY_UPSCALE_GROUPS
+                and (f"images/{img_id}.jpg" in extra_files or upscale_image(fetcher, url_full, img_id, extra_files))
+            ):
+                images.append(f"{base_url}/images/{img_id}.jpg")
+                report.add_upscaled(r.sku, img_id, url_full, dims, "משנית")
+                report.info(f"{r.sku}: תמונה משנית {img_id} ({dims[0]}x{dims[1]}) הוגדלה ל-{UPSCALE_SIZE}x{UPSCALE_SIZE}")
             elif k == 0 and dims and min(dims) >= MIN_UPSCALE_SOURCE and r.group not in approved_groups:
                 # Needs the owner's OK first. A business decision, so it must not trip the safety net.
                 main_ok = False
@@ -880,7 +904,8 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
                 )
                 break
             else:
-                report.info(f"{r.sku}: תמונה משנית דולגה (קטנה מ-{MIN_IMAGE_SIDE} או לא נקראה)")
+                size_txt = f"{dims[0]}x{dims[1]}" if dims else "לא נקראה"
+                report.info(f"{r.sku}: תמונה משנית דולגה ({size_txt}, נדרש לפחות {MIN_IMAGE_SIDE})")
         if not main_ok:
             continue
 
@@ -1043,6 +1068,39 @@ def index_html(categories: List[Tuple[str, str, int]], base_url: str, now: datet
     )
 
 
+def review_html(upscaled: Dict[str, Dict], now: datetime) -> str:
+    """Original next to enlarged, for every image enlarged in this run (for the owner, not for Zap)."""
+    local = israel_now(now)
+    cards = []
+    for img_id, e in upscaled.items():
+        mine = f"images/{img_id}.jpg"
+        cards.append(
+            '<section class="card">\n'
+            f"<h2>{xml_text(', '.join(e['skus']))} <small>(תמונה {xml_text(e['kind'])})</small></h2>\n"
+            f"<p>מזהה תמונה: <code>{xml_text(img_id)}</code> | לפני: {xml_text(e['before'])} | "
+            f"אחרי: {UPSCALE_SIZE}x{UPSCALE_SIZE} | <a href=\"{xml_text(mine)}\">קובץ מוגדל</a> | "
+            f"<a href=\"{xml_text(e['source'])}\">מקור</a></p>\n"
+            '<div class="pair">\n'
+            f'<figure><img src="{xml_text(e["source"])}" alt="מקור"><figcaption>מקור ({xml_text(e["before"])})</figcaption></figure>\n'
+            f'<figure><img src="{xml_text(mine)}" alt="מוגדלת"><figcaption>מוגדלת ({UPSCALE_SIZE}x{UPSCALE_SIZE})</figcaption></figure>\n'
+            "</div>\n</section>"
+        )
+    body = "\n".join(cards) if cards else "<p>בריצה הזאת לא הוגדלו תמונות.</p>"
+    return (
+        '<!DOCTYPE html>\n<html lang="he" dir="rtl">\n<head>\n<meta charset="UTF-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<meta name="robots" content="noindex">\n'
+        f"<title>{STORE_NAME} | בדיקת תמונות מוגדלות</title>\n"
+        "<style>body{font-family:sans-serif;margin:16px;background:#fff;color:#111}"
+        ".card{border:1px solid #ccc;padding:12px;margin-bottom:16px}"
+        ".pair{display:flex;gap:12px;flex-wrap:wrap}figure{margin:0;flex:1 1 300px}"
+        "img{width:100%;height:auto;border:1px solid #eee;background:#fafafa}</style>\n"
+        "</head>\n<body>\n"
+        f"<h1>{STORE_NAME}: תמונות שהוגדלו ({len(upscaled)})</h1>\n<p>עודכן: {local:%d/%m/%Y %H:%M}</p>\n"
+        f"{body}\n</body>\n</html>\n"
+    )
+
+
 def index_xml(categories: List[Tuple[str, str, int]], base_url: str, now: datetime) -> str:
     out = ['<?xml version="1.0" encoding="UTF-8"?>', store_header(now), "<CATEGORIES>"]
     for name, slug, n in categories:
@@ -1190,6 +1248,7 @@ def run(
         files[f"products/{it.row.sku}.xml"] = product_xml(it, settings, terms)
     files["index.html"] = index_html(cats_for_index, base_url, now)
     files["index.xml"] = index_xml(cats_for_index, base_url, now)
+    files["review.html"] = review_html(report.upscaled, now)
 
     write_site(out_dir, files)
 

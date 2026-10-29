@@ -254,6 +254,83 @@ class Tests(unittest.TestCase):
         info = ET.parse(os.path.join(tmp, "site", "products", "A-1.xml")).getroot()
         self.assertTrue(info.find("./Images/Image").get("url").startswith("https://example.test/zap/images/"))
 
+    def _run_secondary(self, size, approve="כן", groups=("G1",)):
+        """Main image is fine (1024); the secondary IMG2 is a real JPEG of `size`."""
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        import io
+        from unittest import mock
+
+        buf = io.BytesIO()
+        Image.new("RGB", size, (30, 30, 200)).save(buf, "JPEG")
+        second_jpg = buf.getvalue()
+
+        class SmallSecond(FakeFetcher):
+            def get(self, url, max_bytes=None):
+                if url.endswith(".jpg") and "ecdn" in url and IMG2 in url:
+                    return second_jpg
+                return super().get(url, max_bytes)
+
+        tmp = tempfile.mkdtemp()
+        data = {"settings": SETTINGS, "products": [HEAD, prow("A-1", "M", 3, approve=approve), prow("A-2", "L", 3)],
+                "sales": [["h"]]}
+        with mock.patch.object(g, "SECONDARY_UPSCALE_GROUPS", set(groups)):
+            rep = g.run(SmallSecond(), "x", {"products": 1, "settings": 2, "sales": 3},
+                        "https://www.hdsale.co.il/mirrors/zap/catalog.xml", "https://example.test/zap",
+                        os.path.join(tmp, "site"), os.path.join(tmp, "rep"), os.path.join(tmp, "cache"),
+                        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "terms.txt"),
+                        sheet_reader=lambda n: data[n])
+        site = os.path.join(tmp, "site")
+        urls = [i.get("url") for i in ET.parse(os.path.join(site, "products", "A-1.xml")).getroot().findall("./Images/Image")]
+        review = open(os.path.join(site, "review.html"), encoding="utf-8").read()
+        return rep, site, urls, review
+
+    def test_secondary_image_upscaled_for_trial_group(self):
+        from PIL import Image
+
+        rep, site, urls, review = self._run_secondary((600, 500))
+        self.assertEqual(rep.stats["published"], 2)
+        self.assertEqual(len(urls), 2)
+        self.assertEqual(urls[1], f"https://example.test/zap/images/{IMG2}.jpg")
+        self.assertEqual(Image.open(os.path.join(site, "images", f"{IMG2}.jpg")).size, (1024, 1024))
+        # One image shared by both variants: one review entry listing both SKUs.
+        self.assertEqual(list(rep.upscaled), [IMG2])
+        self.assertEqual(rep.upscaled[IMG2]["skus"], ["A-1", "A-2"])
+        self.assertIn(IMG2, review)
+        self.assertIn("600x500", review)
+        self.assertIn("1024x1024", review)
+        self.assertIn(f"images/{IMG2}.jpg", review)
+        self.assertIn(f"https://ecdn.crosphera.net/{BASE}/{IMG2}.jpg", review)
+
+    def test_secondary_image_not_upscaled_outside_trial(self):
+        rep, site, urls, review = self._run_secondary((600, 500), groups=("18890113",))
+        self.assertEqual(rep.stats["published"], 2)
+        self.assertEqual(len(urls), 1)
+        self.assertFalse(os.path.exists(os.path.join(site, "images")))
+        self.assertEqual(rep.upscaled, {})
+        self.assertIn("לא הוגדלו", review)
+
+    def test_secondary_image_needs_approval(self):
+        rep, site, urls, _ = self._run_secondary((600, 500), approve="")
+        self.assertEqual(rep.stats["published"], 2)
+        self.assertEqual(len(urls), 1)
+        self.assertEqual(rep.upscaled, {})
+        self.assertFalse(rep.approvals)  # a skipped secondary never holds the product back
+
+    def test_secondary_image_below_400_dropped(self):
+        rep, site, urls, _ = self._run_secondary((390, 500))
+        self.assertEqual(rep.stats["published"], 2)
+        self.assertEqual(len(urls), 1)
+        self.assertEqual(rep.upscaled, {})
+        self.assertTrue(any("390x500" in m for m in rep.infos))
+
+    def test_review_page_built_every_run(self):
+        _, site = run_with([prow("A-1", "M", 3)])
+        review = open(os.path.join(site, "review.html"), encoding="utf-8").read()
+        self.assertIn("לא הוגדלו", review)
+
 
 if __name__ == "__main__":
     unittest.main()
