@@ -745,7 +745,7 @@ def choose_url(url: str, report: Report, sku: str) -> str:
 MIN_UPSCALE_SOURCE = 400    # smaller sources are too poor to enlarge
 UPSCALE_SIZE = 1024         # square white canvas, side in pixels
 # Trial: secondary images are enlarged only for these product groups (still needs "כן" in column O).
-SECONDARY_UPSCALE_GROUPS = {"18890113"}
+SECONDARY_UPSCALE_GROUPS = {"18890113-1"}  # the group code in column B (טייץ תרמי פרוותי)
 
 
 def upscale_to_square(data: bytes, size: int = UPSCALE_SIZE) -> Optional[bytes]:
