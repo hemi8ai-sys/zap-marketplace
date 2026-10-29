@@ -58,11 +58,11 @@ class FakeFetcher:
 SETTINGS = [["הגדרה", "ערך"], ["שמירת מלאי בצד (יחידות)", "2"], ["יצרן", "HDSALE"], ["מחיר משלוח", "19"],
             ["מספר תשלומים מקסימלי", "3"], ["חודשי אחריות", "12"]]
 HEAD = ["מקט וריאציה", "מקט מוצר", "קישור", "שם המוצר", "מידה", "צבע", "מלאי התחלתי", "נמכר", "כמות נוכחית",
-        "כמות לפרסום", "פעיל", "מחיר", "קטגוריה", "הערות"]
+        "כמות לפרסום", "פעיל", "מחיר", "קטגוריה", "הערות", "אישור הגדלת תמונה"]
 
 
-def prow(sku, size, qty, active="כן", url="https://www.hdsale.co.il/p/shirt", cat="אופנה", price=""):
-    return [sku, "G1", url, "חולצה", size, "שחור", "5", "0", "5", str(qty), active, price, cat, ""]
+def prow(sku, size, qty, active="כן", url="https://www.hdsale.co.il/p/shirt", cat="אופנה", price="", approve=""):
+    return [sku, "G1", url, "חולצה", size, "שחור", "5", "0", "5", str(qty), active, price, cat, "", approve]
 
 
 def run_with(products, small=False, sales=None):
@@ -110,7 +110,7 @@ class Tests(unittest.TestCase):
     def test_small_main_image_excluded(self):
         rep, _ = run_with([prow("A-1", "M", 3)], small=True)
         self.assertEqual(rep.stats["published"], 0)
-        self.assertTrue(any("קטנה" in e for e in rep.errors))
+        self.assertTrue(rep.approvals or any("קטנה" in e for e in rep.errors))
 
     def test_empty_category_gets_page(self):
         rep, site = run_with([prow("A-1", "M", 0)])
@@ -150,6 +150,109 @@ class Tests(unittest.TestCase):
     def test_invalid_sku(self):
         rep, _ = run_with([prow("A 1", "M", 3), prow("B-1", "M", 3)])
         self.assertTrue(any("לא תקין" in e for e in rep.errors))
+
+
+    def test_nested_categories(self):
+        rep, site = run_with([prow("A-1", "M", 3, cat="אופנה > גרביים"), prow("A-2", "L", 2, cat="אופנה")])
+        self.assertEqual(rep.stats["published"], 2)
+        html = open(os.path.join(site, "index.html"), encoding="utf-8").read()
+        ET.fromstring(html.replace("<!DOCTYPE html>", "").replace('<meta charset="UTF-8">', '<meta charset="UTF-8"/>').replace('<meta name="viewport" content="width=device-width, initial-scale=1">', ""))
+        self.assertIn("<ul>", html)
+        self.assertEqual(rep.per_category["אופנה"], 2)
+        self.assertEqual(rep.per_category["אופנה > גרביים"], 1)
+
+    def test_norm_category(self):
+        self.assertEqual(g.norm_category(" אופנה/ גרביים "), "אופנה > גרביים")
+
+    def test_pause_switch_publishes_empty(self):
+        global SETTINGS
+        old = SETTINGS
+        SETTINGS = old + [["השבתת פרסום", "כן"]]
+        try:
+            rep, site = run_with([prow("A-1", "M", 3), prow("A-2", "L", 2)])
+        finally:
+            SETTINGS = old
+        self.assertEqual(rep.stats["published"], 0)
+        self.assertFalse(os.path.exists(os.path.join(site, "products", "A-1.xml")))
+        cat = ET.parse(os.path.join(site, "categories", "fashion.xml")).getroot()
+        self.assertEqual(len(cat.findall("./PRODUCTS/PRODUCT")), 0)
+
+    def test_inactive_row_with_stock_not_published(self):
+        rep, site = run_with([prow("A-1", "M", 5, active="לא"), prow("A-2", "L", 5)])
+        self.assertEqual(rep.stats["published"], 1)
+        self.assertFalse(os.path.exists(os.path.join(site, "products", "A-1.xml")))
+
+    def test_switching_everything_off_is_not_a_fatal_error(self):
+        rows = [prow(f"B-{i}", "M", 5, active="לא") for i in range(12)]
+        rep, _ = run_with(rows)
+        self.assertEqual(rep.stats["published"], 0)
+
+    def test_broken_source_still_trips_safety_net(self):
+        rows = [prow(f"C-{i}", "M", 5, url="") for i in range(12)]
+        with self.assertRaises(g.FatalError):
+            run_with(rows)
+
+    def test_small_image_waits_for_approval(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        import io
+
+        buf = io.BytesIO()
+        Image.new("RGB", (600, 580), (200, 30, 30)).save(buf, "JPEG")
+        small_jpg = buf.getvalue()
+
+        class RealSmall(FakeFetcher):
+            def get(self, url, max_bytes=None):
+                if url.endswith(".jpg") and "ecdn" in url:
+                    return small_jpg
+                return super().get(url, max_bytes)
+
+        rows = [prow(f"P-{i}", "M", 3) for i in range(12)]  # many pending: must not trip the safety net
+        tmp = tempfile.mkdtemp()
+        data = {"settings": SETTINGS, "products": [HEAD] + rows, "sales": [["h"]]}
+        rep = g.run(RealSmall(), "x", {"products": 1, "settings": 2, "sales": 3},
+                    "https://www.hdsale.co.il/mirrors/zap/catalog.xml", "https://example.test/zap",
+                    os.path.join(tmp, "site"), os.path.join(tmp, "rep"), os.path.join(tmp, "cache"),
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "terms.txt"),
+                    sheet_reader=lambda n: data[n])
+        self.assertEqual(rep.stats["published"], 0)
+        self.assertEqual(list(rep.approvals), ["G1"])
+        self.assertIn("600x580", rep.approvals["G1"])
+        self.assertIn("ממתינים לאישור", rep.to_markdown())
+
+    def test_small_main_image_is_upscaled(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        import io
+
+        buf = io.BytesIO()
+        Image.new("RGB", (600, 580), (200, 30, 30)).save(buf, "JPEG")
+        small_jpg = buf.getvalue()
+
+        class RealSmall(FakeFetcher):
+            def get(self, url, max_bytes=None):
+                if url.endswith(".jpg") and "ecdn" in url:
+                    return small_jpg
+                return super().get(url, max_bytes)
+
+        tmp = tempfile.mkdtemp()
+        data = {"settings": SETTINGS, "products": [HEAD, prow("A-1", "M", 3, approve="כן")], "sales": [["h"]]}
+        rep = g.run(RealSmall(), "x", {"products": 1, "settings": 2, "sales": 3},
+                    "https://www.hdsale.co.il/mirrors/zap/catalog.xml", "https://example.test/zap",
+                    os.path.join(tmp, "site"), os.path.join(tmp, "rep"), os.path.join(tmp, "cache"),
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "terms.txt"),
+                    sheet_reader=lambda n: data[n])
+        self.assertEqual(rep.stats["published"], 1)
+        files = os.listdir(os.path.join(tmp, "site", "images"))
+        self.assertEqual(len(files), 1)
+        im = Image.open(os.path.join(tmp, "site", "images", files[0]))
+        self.assertEqual(im.size, (1024, 1024))
+        info = ET.parse(os.path.join(tmp, "site", "products", "A-1.xml")).getroot()
+        self.assertTrue(info.find("./Images/Image").get("url").startswith("https://example.test/zap/images/"))
 
 
 if __name__ == "__main__":

@@ -78,7 +78,11 @@ SETTING_KEYS = {
     "installments": ("מספר תשלומים", int, 12),
     "condition": ("מצב המוצר", str, "חדש"),
     "tax": ("מע", int, 1),
+    # Global kill switch: "כן" publishes an empty marketplace on purpose.
+    "pause": ("השבתת פרסום", str, "לא"),
 }
+
+YES_VALUES = ("כן", "yes", "y", "true", "1")
 
 COLUMN_HEADERS = {
     # key: (substring expected in the normalized header, fallback column index)
@@ -96,6 +100,8 @@ COLUMN_HEADERS = {
     "price": ("מחיר", 11),
     "category": ("קטגוריה", 12),
     "notes": ("הערות", 13),
+    # "כן" in any row of a product approves enlarging its small main image (only for Zap).
+    "upscale_ok": ("אישור הגדלת תמונה", 14),
 }
 
 SKU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
@@ -267,6 +273,7 @@ class Report:
     infos: List[str] = field(default_factory=list)
     stats: Dict[str, int] = field(default_factory=dict)
     per_category: Dict[str, int] = field(default_factory=dict)
+    approvals: Dict[str, str] = field(default_factory=dict)  # product group -> text; waiting for the owner's OK
 
     def error(self, msg: str) -> None:
         self.errors.append(msg)
@@ -289,6 +296,15 @@ class Report:
             f"- לא פורסמו בגלל שגיאה: **{len(self.errors)}**",
             "",
         ]
+        if self.approvals:
+            lines.append(f"## ממתינים לאישור שלך: הגדלת תמונה ({len(self.approvals)} מוצרים)")
+            lines.append(
+                "המוצרים האלה לא מפורסמים כי התמונה הראשית באתר קטנה מדי. "
+                "כדי לאשר הגדלה אוטומטית (רק עבור זאפ) כתוב **כן** בעמודה 'אישור הגדלת תמונה' "
+                "בגיליון, באחת משורות המוצר. אפשר גם להחליף את התמונה באתר."
+            )
+            lines.extend(f"- {m}" for m in self.approvals.values())
+            lines.append("")
         if self.per_category:
             lines.append("## לפי קטגוריה")
             for cat, n in sorted(self.per_category.items()):
@@ -364,6 +380,7 @@ def load_settings(rows: List[List[str]], report: Report) -> Dict[str, object]:
     settings["installments"] = max(1, min(36, int(settings["installments"])))
     settings["reserve"] = max(0, int(settings["reserve"]))
     settings["shipping"] = max(0.0, float(settings["shipping"]))
+    settings["pause"] = str(settings["pause"]).strip().lower() in YES_VALUES
     return settings
 
 
@@ -382,6 +399,7 @@ class Row:
     active: bool
     price_override: Optional[float]
     category: str
+    upscale_ok: bool = False
 
 
 def map_columns(header: List[str]) -> Dict[str, int]:
@@ -442,9 +460,10 @@ def load_rows(rows: List[List[str]], settings: Dict[str, object], report: Report
                 initial=to_int(cell(r, "initial")),
                 sold=to_int(cell(r, "sold")),
                 publish=to_int(cell(r, "publish")),
-                active=active_raw in ("כן", "yes", "y", "true", "1"),
+                active=active_raw in YES_VALUES,
                 price_override=to_float(cell(r, "price")),
                 category=norm_category(cell(r, "category")),
+                upscale_ok=cell(r, "upscale_ok").lower() in YES_VALUES,
             )
         )
         if not SKU_RE.match(out[-1].group):
@@ -713,7 +732,53 @@ def choose_url(url: str, report: Report, sku: str) -> str:
     return best
 
 
-def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_url, page_cache=None) -> List[Item]:
+MIN_UPSCALE_SOURCE = 400    # smaller sources are too poor to enlarge
+UPSCALE_SIZE = 1024         # square white canvas, side in pixels
+
+
+def upscale_to_square(data: bytes, size: int = UPSCALE_SIZE) -> Optional[bytes]:
+    """Enlarge an image onto a white square JPEG. Needs Pillow; returns None if unavailable."""
+    try:
+        from PIL import Image, ImageFilter
+    except ImportError:
+        return None
+    try:
+        im = Image.open(io.BytesIO(data))
+        im.load()
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        else:
+            im = im.convert("RGB")
+        scale = size / max(im.size)
+        new = (max(1, round(im.width * scale)), max(1, round(im.height * scale)))
+        im = im.resize(new, Image.LANCZOS)
+        im = im.filter(ImageFilter.UnsharpMask(radius=1.2, percent=60, threshold=3))
+        canvas = Image.new("RGB", (size, size), (255, 255, 255))
+        canvas.paste(im, ((size - new[0]) // 2, (size - new[1]) // 2))
+        buf = io.BytesIO()
+        canvas.save(buf, "JPEG", quality=92, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def upscale_main(fetcher, url: str, img_id: str, extra_files: Dict) -> bool:
+    try:
+        data = fetcher.get(url)
+    except FetchError:
+        return False
+    out = upscale_to_square(data)
+    if not out:
+        return False
+    extra_files[f"images/{img_id}.jpg"] = out
+    return True
+
+
+def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_url, page_cache=None, extra_files=None) -> List[Item]:
+    extra_files = {} if extra_files is None else extra_files
     checker = ImageChecker(fetcher, img_cache)
     page_cache = {} if page_cache is None else page_cache
     items: List[Item] = []
@@ -721,6 +786,7 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
     group_counts: Dict[str, int] = {}
     for r in rows:
         group_counts[r.group] = group_counts.get(r.group, 0) + 1
+    approved_groups = {r.group for r in rows if r.upscale_ok}
 
     for r in rows:
         report.stats["rows"] = report.stats.get("rows", 0) + 1
@@ -732,6 +798,8 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
             report.stats["no_stock"] = report.stats.get("no_stock", 0) + 1
             report.info(f"{r.sku}: לא יפורסם (אין מלאי לפרסום אחרי שמירה בצד)")
             continue
+        # A row that the sheet wants published; used by the safety net in run().
+        report.stats["eligible"] = report.stats.get("eligible", 0) + 1
         if not r.url:
             report.error(f"שורה {r.line} ({r.sku}): חסר קישור לעמוד המוצר (עמודה C)")
             continue
@@ -783,6 +851,27 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
             dims = checker.size(url_full)
             if dims and min(dims) >= MIN_IMAGE_SIDE:
                 images.append(url_full)
+            elif (
+                k == 0
+                and dims
+                and min(dims) >= MIN_UPSCALE_SOURCE
+                and r.group in approved_groups
+                and (f"images/{img_id}.jpg" in extra_files or upscale_main(fetcher, url_full, img_id, extra_files))
+            ):
+                images.append(f"{base_url}/images/{img_id}.jpg")
+                report.warn(
+                    f"{r.sku}: התמונה הראשית באתר קטנה ({dims[0]}x{dims[1]}). הוגדלה ל-{UPSCALE_SIZE}x{UPSCALE_SIZE} רק עבור זאפ, באישורך. מומלץ להחליף באתר בתמונה גדולה"
+                )
+            elif k == 0 and dims and min(dims) >= MIN_UPSCALE_SOURCE and r.group not in approved_groups:
+                # Needs the owner's OK first. A business decision, so it must not trip the safety net.
+                main_ok = False
+                report.stats["eligible"] = report.stats.get("eligible", 0) - 1
+                label_txt = clean_text(r.name) or clean_text((rec or {}).get("PRODUCT_NAME", "")) or r.group
+                report.approvals.setdefault(
+                    r.group,
+                    f"{r.group} | {label_txt[:60]} | תמונה ראשית {dims[0]}x{dims[1]} | {decode_url(r.url)[:90]}",
+                )
+                break
             elif k == 0:
                 main_ok = False
                 size_txt = f"{dims[0]}x{dims[1]}" if dims else "לא ניתן לקרוא"
@@ -992,7 +1081,7 @@ def load_terms(path: str, settings) -> str:
     return text.replace("{warranty_months}", str(settings["warranty_months"])).replace("{warranty_by}", str(settings["warranty_by"])).strip()
 
 
-def write_site(out_dir: str, files: Dict[str, str]) -> None:
+def write_site(out_dir: str, files: Dict[str, object]) -> None:
     import shutil
 
     if os.path.isdir(out_dir):
@@ -1000,8 +1089,12 @@ def write_site(out_dir: str, files: Dict[str, str]) -> None:
     for rel, content in files.items():
         path = os.path.join(out_dir, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(content)
+        if isinstance(content, bytes):
+            with open(path, "wb") as fh:
+                fh.write(content)
+        else:
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(content)
 
 
 # --------------------------------------------------------------------------
@@ -1047,7 +1140,12 @@ def run(
     except (OSError, ValueError):
         pass
 
-    items = build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_url)
+    extra_files: Dict[str, bytes] = {}
+    if settings["pause"]:
+        items = []
+        report.warn("פרסום מושבת (ההגדרה 'השבתת פרסום' = כן): המרקטפלייס מפורסם ריק בכוונה")
+    else:
+        items = build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_url, extra_files=extra_files)
 
     final: List[Item] = []
     for it in items:
@@ -1058,16 +1156,15 @@ def run(
             final.append(it)
     report.stats["published"] = len(final)
 
-    # Safety net: a sudden collapse usually means a broken source, not a real change.
+    # Safety net: compare what the sheet WANTS published (active, with stock) with what actually
+    # made it out. A big gap means a broken source (feed, pages, images), not a business decision.
+    # Turning products off or zeroing stock in the sheet lowers "eligible" too, so it never trips this.
     state_path = os.path.join(cache_dir, "state.json")
-    try:
-        with open(state_path, encoding="utf-8") as fh:
-            prev = int(json.load(fh).get("published", 0))
-    except (OSError, ValueError):
-        prev = 0
-    if prev >= 10 and len(final) < prev * 0.5:
+    eligible = int(report.stats.get("eligible", 0))
+    if not settings["pause"] and eligible >= 10 and len(final) < eligible * 0.5:
         raise FatalError(
-            f"מספר המוצרים לפרסום ירד מ-{prev} ל-{len(final)}. נראה כמו תקלה במקור הנתונים, ולכן האתר הקודם נשאר כפי שהוא."
+            f"מתוך {eligible} מוצרים שהגיליון רוצה לפרסם, רק {len(final)} עברו בדיקה. "
+            "נראה כמו תקלה במקור הנתונים, ולכן האתר הקודם נשאר כפי שהוא."
         )
 
     categories_all: Dict[str, str] = {}
@@ -1080,7 +1177,8 @@ def run(
         slugs[slug] = name
 
     terms = load_terms(terms_path, settings)
-    files: Dict[str, str] = {".nojekyll": ""}
+    files: Dict[str, object] = {".nojekyll": ""}
+    files.update(extra_files)
     cats_for_index: List[Tuple[str, str, int]] = []
     for name in sorted(categories_all):
         slug = categories_all[name]
