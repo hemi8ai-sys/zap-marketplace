@@ -360,6 +360,24 @@ class Tests(unittest.TestCase):
         self.assertIn(f"`{IMG2}` | 240x500 |", md)
         self.assertIn("(<https://www.hdsale.co.il/p/shirt>)", md)
 
+    def test_group_exception_enlarges_below_250_but_holds_for_review(self):
+        patches = {"SECONDARY_MIN_SOURCE_BY_GROUP": {"G1": 200}}
+        rep, _site, urls, review = self._run_secondary((223, 200), patches=patches)
+        e = rep.upscaled[IMG2]
+        self.assertTrue(e["suspect"])                 # source under QC_MIN_SOURCE
+        self.assertFalse(e["in_xml"])
+        self.assertEqual(len(urls), 1)
+        self.assertEqual(rep.replace, {})             # enlarged, so not "to replace"
+        self.assertIn("לא נכנסת ל-XML", review)
+
+        rep, _site, urls, _ = self._run_secondary((223, 200), approve="אישור ידני", patches=patches)
+        self.assertTrue(rep.upscaled[IMG2]["in_xml"])
+        self.assertEqual(urls[1], f"https://example.test/zap/images/{IMG2}.jpg")
+
+        rep, _site, urls, _ = self._run_secondary((190, 200), patches=patches)  # still under the exception
+        self.assertEqual(rep.upscaled, {})
+        self.assertIn("200", rep.replace[IMG2]["reason"])
+
     def test_replacements_cover_inactive_products(self):
         rep, _site, urls, _ = self._run_secondary((600, 500), rows=[prow("B-1", "M", 3, active="לא", approve="כן")])
         self.assertIsNone(urls)

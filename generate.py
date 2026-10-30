@@ -792,6 +792,13 @@ def choose_url(url: str, report: Report, sku: str) -> str:
 
 MIN_UPSCALE_SOURCE = 400            # main image: smaller sources are too poor to enlarge
 MIN_UPSCALE_SOURCE_SECONDARY = 250  # secondary images (short side); smaller ones stay out of the XML
+# Per-group exceptions to the secondary minimum (column B group code -> short side). Sources under
+# QC_MIN_SOURCE are still marked "לבדיקה", so they need "אישור ידני" before they reach the XML.
+SECONDARY_MIN_SOURCE_BY_GROUP = {"3441075": 200}  # מסיכת סקי: all its secondary images are ~200px high
+
+
+def secondary_min_source(group: str) -> int:
+    return SECONDARY_MIN_SOURCE_BY_GROUP.get(group, MIN_UPSCALE_SOURCE_SECONDARY)
 UPSCALE_SIZE = 1024                 # square white canvas, side in pixels
 
 
@@ -961,8 +968,8 @@ def collect_replacements(rows, feed, fetcher, report, img_cache, page_cache) -> 
                 continue
             if not dims:
                 reason = "לא נקראה"
-            elif min(dims) < MIN_UPSCALE_SOURCE_SECONDARY:
-                reason = f"קטנה מ-{MIN_UPSCALE_SOURCE_SECONDARY}"
+            elif min(dims) < secondary_min_source(group_rows[0].group):
+                reason = f"קטנה מ-{secondary_min_source(group_rows[0].group)}"
             elif not approved:
                 reason = "הגדלה לא אושרה (עמודה O)"
             else:
@@ -1076,7 +1083,7 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
             elif (
                 k > 0
                 and dims
-                and min(dims) >= MIN_UPSCALE_SOURCE_SECONDARY
+                and min(dims) >= secondary_min_source(r.group)
                 and r.group in approved_groups
                 and (qc := enlarge(img_id, url_full))
             ):
