@@ -1266,8 +1266,8 @@ def index_html(categories: List[Tuple[str, str, int]], base_url: str, now: datet
     return (
         '<!DOCTYPE html>\n<html lang="he" dir="rtl">\n<head>\n<meta charset="UTF-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        f"<title>{STORE_NAME} | אתר מראה לזאפ מרקטפלייס</title>\n</head>\n<body>\n"
-        f"<h1>{STORE_NAME}: אתר מראה לזאפ מרקטפלייס</h1>\n<p>עודכן: {local:%d/%m/%Y %H:%M}</p>\n"
+        f"<title>{STORE_NAME} | אתר מראה מרקטפלייס</title>\n</head>\n<body>\n"
+        f"<h1>{STORE_NAME}: אתר מראה מרקטפלייס</h1>\n<p>עודכן: {local:%d/%m/%Y %H:%M}</p>\n"
         f"<ul>\n{_nested_ul(categories, base_url)}\n</ul>\n</body>\n</html>\n"
     )
 
