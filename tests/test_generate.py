@@ -113,8 +113,31 @@ class Tests(unittest.TestCase):
         self.assertTrue(rep.approvals or any("קטנה" in e for e in rep.errors))
 
     def test_empty_category_gets_page(self):
+        # Kept at its address with 0 products (so Zap drops them), but not linked from the index.
         rep, site = run_with([prow("A-1", "M", 0)])
-        self.assertTrue(os.path.exists(os.path.join(site, "categories", "fashion.xml")))
+        cat = ET.parse(os.path.join(site, "categories", "fashion.xml")).getroot()
+        self.assertEqual(len(cat.findall("./PRODUCTS/PRODUCT")), 0)
+        self.assertNotIn("fashion.xml", open(os.path.join(site, "index.html"), encoding="utf-8").read())
+        self.assertNotIn("fashion.xml", open(os.path.join(site, "index.xml"), encoding="utf-8").read())
+
+    def test_index_lists_only_categories_with_products(self):
+        rep, site = run_with([prow("A-1", "M", 3, cat="אופנת גברים"), prow("A-2", "L", 0, cat="אופנת נשים")])
+        html = open(os.path.join(site, "index.html"), encoding="utf-8").read()
+        index = open(os.path.join(site, "index.xml"), encoding="utf-8").read()
+        self.assertIn("https://example.test/zap/categories/mens-fashion.xml", html)
+        self.assertIn("https://example.test/zap/categories/mens-fashion.xml", index)
+        self.assertNotIn("womens-fashion", html)
+        self.assertNotIn("womens-fashion", index)
+        self.assertTrue(os.path.exists(os.path.join(site, "categories", "womens-fashion.xml")))
+
+    def test_new_fashion_categories_have_fixed_slugs(self):
+        self.assertEqual(g.slugify_category("אופנת גברים"), "mens-fashion")
+        self.assertEqual(g.slugify_category("אופנת נשים"), "womens-fashion")
+        self.assertEqual(g.slugify_category("אופנה"), "fashion")
+        self.assertEqual(g.slugify_category("חורף וסקי"), "winter-ski")
+        self.assertEqual(g.slugify_category("ביגוד ספורט גברים"), "mens-sportswear")
+        self.assertEqual(g.slugify_category("ביגוד ספורט נשים"), "womens-sportswear")
+        self.assertEqual(g.slugify_category("תינוקות וילדים קטנים"), "babies-kids")
 
     def test_missing_category_error(self):
         rep, _ = run_with([prow("A-1", "M", 3, cat="")])

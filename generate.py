@@ -48,6 +48,8 @@ CATEGORY_SLUGS = {
     "ביגוד ספורט גברים": "mens-sportswear",
     "ביגוד ספורט נשים": "womens-sportswear",
     "תינוקות וילדים קטנים": "babies-kids",
+    "אופנת גברים": "mens-fashion",
+    "אופנת נשים": "womens-fashion",
 }
 
 MIN_IMAGE_SIDE = 650        # Zap: at least 650x650
@@ -1478,8 +1480,11 @@ def run(
         files[f"categories/{slug}.xml"] = category_xml(cat_items, settings, base_url, now)
     for it in final:
         files[f"products/{it.row.sku}.xml"] = product_xml(it, settings, terms)
-    files["index.html"] = index_html(cats_for_index, base_url, now)
-    files["index.xml"] = index_xml(cats_for_index, base_url, now)
+    # An empty category keeps its (empty) XML so Zap drops its products, but is not linked from the index.
+    # A parent counts its children's products, so a listed child always has its parent listed too.
+    listed = [c for c in cats_for_index if c[2] > 0]
+    files["index.html"] = index_html(listed, base_url, now)
+    files["index.xml"] = index_xml(listed, base_url, now)
     # When each enlarged image was first seen, so review.html can tell new images from checked ones.
     seen_path = os.path.join(cache_dir, "upscaled_seen.json")
     try:
