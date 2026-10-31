@@ -50,6 +50,7 @@ CATEGORY_SLUGS = {
     "תינוקות וילדים קטנים": "babies-kids",
     "אופנת גברים": "mens-fashion",
     "אופנת נשים": "womens-fashion",
+    "תכשיטים": "jewelry",
 }
 
 MIN_IMAGE_SIDE = 650        # Zap: at least 650x650

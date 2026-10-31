@@ -135,6 +135,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(g.slugify_category("אופנת נשים"), "womens-fashion")
         self.assertEqual(g.slugify_category("אופנה"), "fashion")
         self.assertEqual(g.slugify_category("חורף וסקי"), "winter-ski")
+        self.assertEqual(g.slugify_category("תכשיטים"), "jewelry")
         self.assertEqual(g.slugify_category("ביגוד ספורט גברים"), "mens-sportswear")
         self.assertEqual(g.slugify_category("ביגוד ספורט נשים"), "womens-sportswear")
         self.assertEqual(g.slugify_category("תינוקות וילדים קטנים"), "babies-kids")
