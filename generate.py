@@ -799,8 +799,16 @@ MIN_UPSCALE_SOURCE_SECONDARY = 250  # secondary images (short side); smaller one
 SECONDARY_MIN_SOURCE_BY_GROUP = {"3441075": 200}  # מסיכת סקי: all its secondary images are ~200px high
 
 
+# Per-group exceptions to the main-image minimum (column B group code -> short side).
+MAIN_MIN_SOURCE_BY_GROUP = {"9507003": 350}  # חגורה דמוי עור: main image is 398x350
+
+
 def secondary_min_source(group: str) -> int:
     return SECONDARY_MIN_SOURCE_BY_GROUP.get(group, MIN_UPSCALE_SOURCE_SECONDARY)
+
+
+def main_min_source(group: str) -> int:
+    return MAIN_MIN_SOURCE_BY_GROUP.get(group, MIN_UPSCALE_SOURCE)
 UPSCALE_SIZE = 1024                 # square white canvas, side in pixels
 
 
@@ -1061,7 +1069,7 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
             elif (
                 k == 0
                 and dims
-                and min(dims) >= MIN_UPSCALE_SOURCE
+                and min(dims) >= main_min_source(r.group)
                 and r.group in approved_groups
                 and (qc := enlarge(img_id, url_full))
             ):
@@ -1099,7 +1107,7 @@ def build_items(rows, settings, feed, fetcher, sales, report, img_cache, base_ur
                     continue
                 images.append(f"{base_url}/images/{img_id}.jpg")
                 report.info(f"{r.sku}: תמונה משנית {img_id} ({dims[0]}x{dims[1]}) הוגדלה ל-{UPSCALE_SIZE}x{UPSCALE_SIZE}")
-            elif k == 0 and dims and min(dims) >= MIN_UPSCALE_SOURCE and r.group not in approved_groups:
+            elif k == 0 and dims and min(dims) >= main_min_source(r.group) and r.group not in approved_groups:
                 # Needs the owner's OK first. A business decision, so it must not trip the safety net.
                 main_ok = False
                 report.stats["eligible"] = report.stats.get("eligible", 0) - 1

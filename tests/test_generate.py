@@ -436,6 +436,20 @@ class Tests(unittest.TestCase):
         self.assertEqual(rep.upscaled, {})
         self.assertTrue(any("300x300" in e for e in rep.errors))
 
+        # A per-group exception lowers the main minimum for that group only.
+        from unittest import mock
+
+        tmp = tempfile.mkdtemp()
+        with mock.patch.object(g, "MAIN_MIN_SOURCE_BY_GROUP", {"G1": 300}):
+            rep = g.run(RealSmall(), "x", {"products": 1, "settings": 2, "sales": 3},
+                        "https://www.hdsale.co.il/mirrors/zap/catalog.xml", "https://example.test/zap",
+                        os.path.join(tmp, "site"), os.path.join(tmp, "rep"), os.path.join(tmp, "cache"),
+                        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "terms.txt"),
+                        sheet_reader=lambda n: data[n])
+        self.assertEqual(rep.stats["published"], 1)
+        self.assertEqual(rep.upscaled[IMG1]["kind"], "ראשית")
+        self.assertTrue(rep.upscaled[IMG1]["in_xml"])
+
     def test_review_page_built_every_run(self):
         _, site = run_with([prow("A-1", "M", 3)])
         review = open(os.path.join(site, "review.html"), encoding="utf-8").read()
